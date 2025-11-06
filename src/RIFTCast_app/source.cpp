@@ -215,8 +215,18 @@ public:
         if(vertices.numel() > 0)
         {
             // Update mesh for later render
+            if (smplx_graphs.size() <= mesh_frame_idx_local) 
+            { 
+                smplx_graphs.resize(mesh_frame_idx_local + 1); 
+                smplx_graphs[mesh_frame_idx_local] = nullptr;
+            }
+            if (smplx_graphs[mesh_frame_idx_local] == nullptr)
+            {
+                smplx_graphs[mesh_frame_idx_local] = 
+                    atcg::IO::read_mesh("res/meshes/smplest_x_mesh_" + std::to_string(mesh_frame_idx_local) + ".obj");
+            }
             auto& geometry = mesh_entity.getComponent<atcg::GeometryComponent>();
-            geometry.graph = atcg::IO::read_mesh("res/meshes/smplest_x_mesh_" + std::to_string(mesh_frame_idx_local) + ".obj");
+            geometry.graph = smplx_graphs[mesh_frame_idx_local];
 
             pointcloud->resizeVertices(vertices.size(0));
             pointcloud->getDevicePositions().index_put_({torch::indexing::Slice(), torch::indexing::Slice()}, vertices);
@@ -623,6 +633,7 @@ private:
     atcg::Entity hovered_entity;
 
     atcg::Entity mesh_entity;
+    std::vector<atcg::ref_ptr<atcg::Graph>> smplx_graphs;
     uint32_t mesh_frame_idx = 0;
 
     atcg::ref_ptr<rift::DatasetImporter> dataloader;
