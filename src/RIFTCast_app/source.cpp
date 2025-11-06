@@ -144,6 +144,7 @@ public:
             {
                 // Send output to inpainting thread
                 std::lock_guard guard(render_mutex);
+                mesh_frame_idx = reconstruction.current_frame;
                 render_output_img                 = img_data;
                 render_output_depth               = depth_data;
                 render_output_normals             = normal_data;
@@ -177,6 +178,9 @@ public:
         torch::Tensor output_depth;
         torch::Tensor output_normals;
         glm::mat4 inv_view_projection;
+
+        uint32_t mesh_frame_idx_local = 0;
+
         if(rendering_done)
         {
             rendering_done = false;
@@ -185,6 +189,8 @@ public:
             render_input_height     = atcg::Renderer::getFramebuffer()->height();
             render_input_view       = camera_controller->getCamera()->getView();
             render_input_projection = camera_controller->getCamera()->getProjection();
+
+            mesh_frame_idx_local = mesh_frame_idx;
 
             // 2. Get pointcloud data
             if(render_output_img.numel() > 0)    // Should only happen for first frame
@@ -208,6 +214,10 @@ public:
             rift::unprojectVertices(output_img, inv_view_projection, output_depth, output_normals);
         if(vertices.numel() > 0)
         {
+            // Update mesh for later render
+            auto& geometry = mesh_entity.getComponent<atcg::GeometryComponent>();
+            geometry.graph = atcg::IO::read_mesh("res/meshes/smplest_x_mesh_" + std::to_string(mesh_frame_idx_local) + ".obj");
+
             pointcloud->resizeVertices(vertices.size(0));
             pointcloud->getDevicePositions().index_put_({torch::indexing::Slice(), torch::indexing::Slice()}, vertices);
             pointcloud->getDeviceColors().index_put_({torch::indexing::Slice(), torch::indexing::Slice()}, colors);
@@ -267,6 +277,14 @@ public:
 
         auto skybox = atcg::IO::imread("res/skybox_vci.hdr");
         scene->setSkybox(skybox);
+
+        {
+            mesh_entity = scene->createEntity("TestMesh");
+            auto& transform = mesh_entity.addComponent<atcg::TransformComponent>();
+            transform.setPosition(glm::vec3(1.0f, 0.0f, 1.0f));
+            mesh_entity.addComponent<atcg::GeometryComponent>(nullptr);
+            auto& renderer      = mesh_entity.addComponent<atcg::MeshRenderComponent>();
+        }
 
         auto f = pfd::open_file("Choose scene meta file", pfd::path::home(), {"Json", "*.json"}, pfd::opt::none);
         std::string meta_file = f.result()[0];
@@ -603,7 +621,9 @@ private:
 
     atcg::ref_ptr<atcg::Scene> scene;
     atcg::Entity hovered_entity;
+
     atcg::Entity mesh_entity;
+    uint32_t mesh_frame_idx = 0;
 
     atcg::ref_ptr<rift::DatasetImporter> dataloader;
     // atcg::ref_ptr<rift::GeometryModule> geometry_module;

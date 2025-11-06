@@ -11,3 +11,6 @@ typings
 docs/processed_README.md
 
 inpainting
+
+/res/meta.json
+/res/meshes
