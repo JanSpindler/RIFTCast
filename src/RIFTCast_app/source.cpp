@@ -1,4 +1,4 @@
-#define ATCG_BUILD_VR true
+#define BUILD_VR true
 
 #include <iostream>
 
@@ -144,7 +144,7 @@ public:
             {
                 // Send output to inpainting thread
                 std::lock_guard guard(render_mutex);
-                mesh_frame_idx = reconstruction.current_frame;
+                mesh_frame_idx                    = reconstruction.current_frame;
                 render_output_img                 = img_data;
                 render_output_depth               = depth_data;
                 render_output_normals             = normal_data;
@@ -216,7 +216,8 @@ public:
         {
             // Update mesh for later render
             auto& geometry = mesh_entity.getComponent<atcg::GeometryComponent>();
-            geometry.graph = atcg::IO::read_mesh("res/meshes/smplest_x_mesh_" + std::to_string(mesh_frame_idx_local) + ".obj");
+            geometry.graph =
+                atcg::IO::read_mesh("res/meshes/smplest_x_mesh_" + std::to_string(mesh_frame_idx_local) + ".obj");
 
             pointcloud->resizeVertices(vertices.size(0));
             pointcloud->getDevicePositions().index_put_({torch::indexing::Slice(), torch::indexing::Slice()}, vertices);
@@ -249,22 +250,32 @@ public:
             renderer.shader     = atcg::ShaderManager::getShader("flat");
         }
 
-        if(atcg::VR::isVRAvailable() && ATCG_BUILD_VR)
+        uint32_t width, height;
+        if(BUILD_VR && atcg::VR::isVRAvailable())
         {
             atcg::VR::setNear(0.01f);
             atcg::VR::setFar(10.0f);
-            float aspect_ratio = (float)atcg::VR::width() / (float)atcg::VR::height();
-            atcg::CameraExtrinsics extrinsics;
-            atcg::CameraIntrinsics intrinsics;
-            intrinsics.setAspectRatio(aspect_ratio);
-            camera_controller =
-                atcg::make_ref<atcg::VRController>(atcg::make_ref<atcg::PerspectiveCamera>(extrinsics, intrinsics),
-                                                   atcg::make_ref<atcg::PerspectiveCamera>(extrinsics, intrinsics));
+            width              = atcg::VR::width();
+            height             = atcg::VR::height();
+            float aspect_ratio = (float)width / (float)height;
+            atcg::CameraIntrinsics instrinsics_left(atcg::VR::getProjection(atcg::VRSystem::Eye::LEFT));
+            atcg::CameraIntrinsics instrinsics_right(atcg::VR::getProjection(atcg::VRSystem::Eye::RIGHT));
+            instrinsics_left.setAspectRatio(aspect_ratio);
+            instrinsics_right.setAspectRatio(aspect_ratio);
+
+            atcg::CameraExtrinsics extrinsics_left(glm::inverse(atcg::VR::getInverseView(atcg::VRSystem::Eye::LEFT)));
+            atcg::CameraExtrinsics extrinsics_right(glm::inverse(atcg::VR::getInverseView(atcg::VRSystem::Eye::RIGHT)));
+            camera_controller = atcg::make_ref<atcg::VRController>(
+                atcg::make_ref<atcg::PerspectiveCamera>(extrinsics_left, instrinsics_left),
+                atcg::make_ref<atcg::PerspectiveCamera>(extrinsics_right, instrinsics_right));
             atcg::VR::initControllerMeshes(scene);
         }
         else
         {
-            float aspect_ratio = (float)window->getWidth() / (float)window->getHeight();
+            const auto& window = atcg::Application::get()->getWindow();
+            width              = window->getWidth();
+            height             = window->getHeight();
+            float aspect_ratio = (float)width / (float)height;
             atcg::CameraExtrinsics extrinsics;
             atcg::CameraIntrinsics intrinsics;
             intrinsics.setAspectRatio(aspect_ratio);
@@ -279,11 +290,11 @@ public:
         scene->setSkybox(skybox);
 
         {
-            mesh_entity = scene->createEntity("TestMesh");
+            mesh_entity     = scene->createEntity("TestMesh");
             auto& transform = mesh_entity.addComponent<atcg::TransformComponent>();
             transform.setPosition(glm::vec3(1.0f, 0.0f, 1.0f));
             mesh_entity.addComponent<atcg::GeometryComponent>(nullptr);
-            auto& renderer      = mesh_entity.addComponent<atcg::MeshRenderComponent>();
+            auto& renderer = mesh_entity.addComponent<atcg::MeshRenderComponent>();
         }
 
         auto f = pfd::open_file("Choose scene meta file", pfd::path::home(), {"Json", "*.json"}, pfd::opt::none);
@@ -364,9 +375,72 @@ public:
         atcg::Renderer::setClearColor(glm::vec4(1));
         atcg::Renderer::clear();
 
-        scene->draw(camera_controller->getCamera());
-        atcg::Renderer::drawCameras(scene, camera_controller->getCamera());
-        atcg::Renderer::drawCADGrid(camera_controller->getCamera());
+        if(BUILD_VR && atcg::VR::isVRAvailable())
+        {
+            atcg::ref_ptr<atcg::VRController> controller =
+                std::dynamic_pointer_cast<atcg::VRController>(camera_controller);
+
+            if(controller->inMovement())
+            {
+                atcg::VR::setMovementLine(controller->getControllerPosition(), controller->getControllerIntersection());
+            }
+
+            auto [t_left, t_right] = atcg::VR::getRenderTargets();
+
+            t_left->use();
+            atcg::Renderer::setViewport(0, 0, atcg::VR::width(), atcg::VR::height());
+
+            atcg::Renderer::clear();
+
+            controller->getCameraLeft()->setFar(1000.0f);
+            scene->draw(controller->getCameraLeft());
+            controller->getCameraLeft()->setFar(10.0f);
+
+            atcg::Renderer::drawCameras(scene, controller->getCameraLeft());
+
+            atcg::Renderer::drawCADGrid(camera_controller->getCamera());
+
+            if(controller->inMovement())
+            {
+                atcg::VR::drawMovementLine(controller->getCameraLeft());
+            }
+
+            t_right->use();
+
+            atcg::Renderer::clear();
+
+            controller->getCameraRight()->setFar(1000.0f);
+            scene->draw(controller->getCameraRight());
+            controller->getCameraRight()->setFar(10.0f);
+
+            atcg::Renderer::drawCameras(scene, controller->getCameraRight());
+
+            atcg::Renderer::drawCADGrid(camera_controller->getCamera());
+
+
+            // atcg::Renderer::drawCADGrid(controller->getCameraRight());
+
+            if(controller->inMovement())
+            {
+                atcg::VR::drawMovementLine(controller->getCameraRight());
+            }
+
+            atcg::Renderer::useScreenBuffer();
+            atcg::Renderer::setDefaultViewport();
+
+            atcg::VR::renderToScreen();
+        }
+        else
+        {
+            atcg::Renderer::clear();
+            camera_controller->getCamera()->setFar(1000.0f);
+            scene->draw(camera_controller->getCamera());
+            camera_controller->getCamera()->setFar(10.0f);
+            atcg::Renderer::drawCameras(scene, camera_controller->getCamera());
+
+            atcg::Renderer::drawCADGrid(camera_controller->getCamera());
+        }
+
 
         time_passed += delta_time;
 
