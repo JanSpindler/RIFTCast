@@ -185,8 +185,10 @@ public:
         {
             rendering_done = false;
             // 1. Update input for rendering thread
-            render_input_width      = atcg::Renderer::getFramebuffer()->width();
-            render_input_height     = atcg::Renderer::getFramebuffer()->height();
+            render_input_width =
+                (BUILD_VR && atcg::VR::isVRAvailable()) ? atcg::VR::width() : atcg::Renderer::getFramebuffer()->width();
+            render_input_height     = (BUILD_VR && atcg::VR::isVRAvailable()) ? atcg::VR::height()
+                                                                              : atcg::Renderer::getFramebuffer()->height();
             render_input_view       = camera_controller->getCamera()->getView();
             render_input_projection = camera_controller->getCamera()->getProjection();
 
@@ -216,8 +218,8 @@ public:
         {
             // Update mesh for later render
             auto& geometry = mesh_entity.getComponent<atcg::GeometryComponent>();
-            geometry.graph =
-                atcg::IO::read_mesh("res/meshes/smplest_x_mesh_" + std::to_string(mesh_frame_idx_local) + ".obj");
+            // geometry.graph =
+            //     atcg::IO::read_mesh("res/meshes/smplest_x_mesh_" + std::to_string(mesh_frame_idx_local) + ".obj");
 
             pointcloud->resizeVertices(vertices.size(0));
             pointcloud->getDevicePositions().index_put_({torch::indexing::Slice(), torch::indexing::Slice()}, vertices);
@@ -246,7 +248,7 @@ public:
             pointcloud = atcg::Graph::createPointCloud();
             reconstruction.addComponent<atcg::GeometryComponent>(pointcloud);
             auto& renderer      = reconstruction.addComponent<atcg::PointRenderComponent>();
-            renderer.point_size = 2;
+            renderer.point_size = 3;
             renderer.shader     = atcg::ShaderManager::getShader("flat");
         }
 
@@ -398,7 +400,7 @@ public:
 
             atcg::Renderer::drawCameras(scene, controller->getCameraLeft());
 
-            atcg::Renderer::drawCADGrid(camera_controller->getCamera());
+            atcg::Renderer::drawCADGrid(controller->getCameraLeft());
 
             if(controller->inMovement())
             {
@@ -415,7 +417,7 @@ public:
 
             atcg::Renderer::drawCameras(scene, controller->getCameraRight());
 
-            atcg::Renderer::drawCADGrid(camera_controller->getCamera());
+            atcg::Renderer::drawCADGrid(controller->getCameraRight());
 
 
             // atcg::Renderer::drawCADGrid(controller->getCameraRight());
