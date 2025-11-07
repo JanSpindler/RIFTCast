@@ -526,7 +526,7 @@ public:
                 state->render_output_depth               = depth_data;
                 state->render_output_mask                = mask;
                 state->render_output_inv_view_projection = glm::inverse(projection * view);
-                state->render_output_frame_idx           = render_output_frame_idx;
+                state->render_output_frame_idx           = current_frame;
                 render_stream.synchronize();
 
                 state->rendering_done = true;
