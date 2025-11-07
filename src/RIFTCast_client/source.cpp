@@ -102,9 +102,10 @@ public:
         {
             if(!done)
             {
-                auto [current_vertices_local, frame_idx] = request_vertices(current_view, current_projection, current_width, current_height);
+                auto [current_vertices_local, frame_idx] =
+                    request_vertices(current_view, current_projection, current_width, current_height);
                 current_vertices = current_vertices_local;
-                mesh_frame_idx = frame_idx;
+                mesh_frame_idx   = frame_idx;
                 done             = true;
             }
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
@@ -137,18 +138,19 @@ public:
             // SMPL-X
             {
                 // Load SMPL-X mesh and set current frame
-                if (smplx_graphs.size() <= mesh_frame_idx) 
+                if(smplx_graphs.size() <= mesh_frame_idx)
                 {
-                    smplx_graphs.resize(mesh_frame_idx + 1); 
+                    smplx_graphs.resize(mesh_frame_idx + 1);
                     smplx_graphs[mesh_frame_idx] = nullptr;
                 }
-                if (smplx_graphs[mesh_frame_idx] == nullptr)
+                if(smplx_graphs[mesh_frame_idx] == nullptr)
                 {
-                    for (size_t frame_idx = 0; frame_idx < smplx_graphs.size(); ++frame_idx) 
+                    for(size_t frame_idx = 0; frame_idx < smplx_graphs.size(); ++frame_idx)
                     {
-                        if (smplx_graphs[frame_idx] == nullptr) 
+                        if(smplx_graphs[frame_idx] == nullptr)
                         {
-                            const std::string mesh_path = "/data/jspindle/meshes/smplest_x_mesh_" + std::to_string(frame_idx) + ".obj";
+                            const std::string mesh_path =
+                                "/data/jspindle/meshes/smplest_x_mesh_" + std::to_string(frame_idx) + ".obj";
                             std::cout << "Loading mesh: " << mesh_path << std::endl;
                             smplx_graphs[frame_idx] = atcg::IO::read_mesh(mesh_path);
                         }
@@ -159,7 +161,8 @@ public:
 
                 // Update SMPL-X translation for moving out of origin
                 auto& transform = mesh_entity.getComponent<atcg::TransformComponent>();
-                transform.setPosition(glm::vec3(1.0f, 0.0f, 1.0f) * static_cast<float>(mesh_frame_idx) * 0.005f + glm::vec3(-0.35f, 0.0f, -0.25f));
+                transform.setPosition(glm::vec3(1.0f, 0.0f, 1.0f) * static_cast<float>(mesh_frame_idx) * 0.005f +
+                                      glm::vec3(-0.35f, 0.0f, -0.25f));
             }
 
             done = false;
@@ -294,7 +297,7 @@ public:
             mesh_entity = scene->createEntity("SMPL-X Mesh");
             mesh_entity.addComponent<atcg::TransformComponent>();
             mesh_entity.addComponent<atcg::GeometryComponent>();
-            mesh_entity.addComponent<atcg::MeshRendererComponent>();
+            mesh_entity.addComponent<atcg::MeshRenderComponent>();
         }
 
         uint32_t width, height;
