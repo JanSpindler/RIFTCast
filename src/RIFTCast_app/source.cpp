@@ -218,14 +218,21 @@ public:
         {
             // Update mesh for later render
             if (smplx_graphs.size() <= mesh_frame_idx_local) 
-            { 
+            {
                 smplx_graphs.resize(mesh_frame_idx_local + 1); 
                 smplx_graphs[mesh_frame_idx_local] = nullptr;
             }
             if (smplx_graphs[mesh_frame_idx_local] == nullptr)
             {
-                smplx_graphs[mesh_frame_idx_local] = 
-                    atcg::IO::read_mesh("res/meshes/smplest_x_mesh_" + std::to_string(mesh_frame_idx_local) + ".obj");
+                for (size_t frame_idx = 0; frame_idx < smplx_graphs.size(); ++frame_idx) 
+                {
+                    if (smplx_graphs[frame_idx] == nullptr) 
+                    {
+                        const std::string mesh_path = "/data/jspindle/meshes/smplest_x_mesh_" + std::to_string(frame_idx) + ".obj";
+                        std::cout << "Loading mesh: " << mesh_path << std::endl;
+                        smplx_graphs[frame_idx] = atcg::IO::read_mesh(mesh_path);
+                    }
+                }
             }
             auto& geometry = mesh_entity.getComponent<atcg::GeometryComponent>();
             geometry.graph = smplx_graphs[mesh_frame_idx_local];
