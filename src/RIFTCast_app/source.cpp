@@ -216,7 +216,7 @@ public:
             rift::unprojectVertices(output_img, inv_view_projection, output_depth, output_normals);
         if(vertices.numel() > 0)
         {
-            // Update mesh for later render
+            // Load SMPL-X mesh and set current frame
             if (smplx_graphs.size() <= mesh_frame_idx_local) 
             {
                 smplx_graphs.resize(mesh_frame_idx_local + 1); 
@@ -237,6 +237,11 @@ public:
             auto& geometry = mesh_entity.getComponent<atcg::GeometryComponent>();
             geometry.graph = smplx_graphs[mesh_frame_idx_local];
 
+            // Update SMPL-X translation for moving out of origin
+            auto& transform = mesh_entity.getComponent<atcg::TransformComponent>();
+            transform.setPosition(glm::vec3(1.0f, 0.0f, 1.0f) * static_cast<float>(mesh_frame_idx_local) * 0.005f + glm::vec3(-0.35f, 0.0f, -0.25f));
+
+            // Point cloud
             pointcloud->resizeVertices(vertices.size(0));
             pointcloud->getDevicePositions().index_put_({torch::indexing::Slice(), torch::indexing::Slice()}, vertices);
             pointcloud->getDeviceColors().index_put_({torch::indexing::Slice(), torch::indexing::Slice()}, colors);
@@ -308,9 +313,8 @@ public:
         scene->setSkybox(skybox);
 
         {
-            mesh_entity     = scene->createEntity("TestMesh");
+            mesh_entity     = scene->createEntity("SMPL-X Mesh");
             auto& transform = mesh_entity.addComponent<atcg::TransformComponent>();
-            transform.setPosition(glm::vec3(1.0f, 0.0f, 1.0f));
             mesh_entity.addComponent<atcg::GeometryComponent>(nullptr);
             auto& renderer = mesh_entity.addComponent<atcg::MeshRenderComponent>();
         }
