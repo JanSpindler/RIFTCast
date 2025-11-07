@@ -64,6 +64,7 @@ struct ClientState
     torch::Tensor render_output_img;
     torch::Tensor render_output_mask;
     torch::Tensor render_output_depth;
+    uint32_t render_output_frame_idx;
     glm::mat4 render_output_inv_view_projection;
 
     // Memory exlcusive for inpainting thread
@@ -525,6 +526,7 @@ public:
                 state->render_output_depth               = depth_data;
                 state->render_output_mask                = mask;
                 state->render_output_inv_view_projection = glm::inverse(projection * view);
+                state->render_output_frame_idx           = render_output_frame_idx;
                 render_stream.synchronize();
 
                 state->rendering_done = true;
@@ -590,7 +592,7 @@ public:
             torch::Tensor depth_tensor;
             glm::mat4 inv_view_projection;
 
-
+            uint32_t local_frame_idx = 0;
             {
                 // Get data from render thread
                 std::lock_guard guard(state->render_mutex);
@@ -599,6 +601,7 @@ public:
                 mask_tensor         = state->render_output_mask.clone();
                 depth_tensor        = state->render_output_depth.clone();
                 inv_view_projection = state->render_output_inv_view_projection;
+                local_frame_idx     = state->render_output_frame_idx;
             }
             auto img_data   = img_tensor;
             auto depth_data = depth_tensor;
@@ -633,7 +636,11 @@ public:
             {
                 std::lock_guard guard(state->inpaint_mutex);
                 state->current_response =
-                    std::move(rift::protocol::createUpdateMessage(inv_view_projection, encoded, compressedData));
+                    std::move(rift::protocol::createUpdateMessage(
+                        inv_view_projection, 
+                        encoded, 
+                        compressedData,
+                        local_frame_idx));
                 state->inpaint_done = true;
             }
 

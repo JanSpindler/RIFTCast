@@ -34,7 +34,7 @@ public:
         client.disconnect();
     }
 
-    torch::Tensor
+    std::pair<torch::Tensor, uint32_t>
     request_vertices(const glm::mat4& view, const glm::mat4& projection, const uint32_t width, const uint32_t height)
     {
         atcg::Timer timer;
@@ -61,6 +61,8 @@ public:
         if(header.task == rift::protocol::MessageTask::NO_UPDATE) return {};
 
         bandwidth_logger.logSample(received_data.size());
+
+        const uint32_t frame_idx = atcg::NetworkUtils::readInt<uint32_t>(received_data.data(), offset);
 
         uint32_t projection_size = atcg::NetworkUtils::readInt<uint32_t>(received_data.data(), offset);
         ATCG_ASSERT(projection_size == sizeof(glm::mat4), "Received wrong size for projection");
@@ -91,7 +93,7 @@ public:
 
         runtime_logger.logSample(timer.elapsedMillis());
 
-        return vertices;
+        return {vertices, frame_idx};
     }
 
     void request_data()
@@ -100,7 +102,9 @@ public:
         {
             if(!done)
             {
-                current_vertices = request_vertices(current_view, current_projection, current_width, current_height);
+                auto [current_vertices_local, frame_idx] = request_vertices(current_view, current_projection, current_width, current_height);
+                current_vertices = current_vertices_local;
+                mesh_frame_idx = frame_idx;
                 done             = true;
             }
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
@@ -129,6 +133,35 @@ public:
             current_height = height;
 
             if(current_vertices.numel() > 0) last_vertices = current_vertices.clone();
+
+            // SMPL-X
+            {
+                // Load SMPL-X mesh and set current frame
+                if (smplx_graphs.size() <= mesh_frame_idx) 
+                {
+                    smplx_graphs.resize(mesh_frame_idx + 1); 
+                    smplx_graphs[mesh_frame_idx] = nullptr;
+                }
+                if (smplx_graphs[mesh_frame_idx] == nullptr)
+                {
+                    for (size_t frame_idx = 0; frame_idx < smplx_graphs.size(); ++frame_idx) 
+                    {
+                        if (smplx_graphs[frame_idx] == nullptr) 
+                        {
+                            const std::string mesh_path = "/data/jspindle/meshes/smplest_x_mesh_" + std::to_string(frame_idx) + ".obj";
+                            std::cout << "Loading mesh: " << mesh_path << std::endl;
+                            smplx_graphs[frame_idx] = atcg::IO::read_mesh(mesh_path);
+                        }
+                    }
+                }
+                auto& geometry = mesh_entity.getComponent<atcg::GeometryComponent>();
+                geometry.graph = smplx_graphs[mesh_frame_idx];
+
+                // Update SMPL-X translation for moving out of origin
+                auto& transform = mesh_entity.getComponent<atcg::TransformComponent>();
+                transform.setPosition(glm::vec3(1.0f, 0.0f, 1.0f) * static_cast<float>(mesh_frame_idx) * 0.005f + glm::vec3(-0.35f, 0.0f, -0.25f));
+            }
+
             done = false;
         }
 
@@ -255,6 +288,13 @@ public:
         {
             auto skybox = atcg::IO::imread("res/skybox_vci.hdr");
             scene->setSkybox(skybox);
+        }
+
+        {
+            mesh_entity = scene->createEntity("SMPL-X Mesh");
+            mesh_entity.addComponent<atcg::TransformComponent>();
+            mesh_entity.addComponent<atcg::GeometryComponent>();
+            mesh_entity.addComponent<atcg::MeshRendererComponent>();
         }
 
         uint32_t width, height;
@@ -595,6 +635,11 @@ private:
     atcg::SceneHierarchyPanel<atcg::ComponentGUIHandler> panel;
 
     bool render_cad = true;
+
+    // SMPL-X
+    atcg::Entity mesh_entity;
+    std::vector<atcg::ref_ptr<atcg::Graph>> smplx_graphs;
+    uint32_t mesh_frame_idx = 0;
 };
 
 class RIFTCastClient : public atcg::Application

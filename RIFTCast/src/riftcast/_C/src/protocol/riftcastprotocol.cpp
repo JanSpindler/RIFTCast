@@ -95,10 +95,16 @@ std::vector<uint8_t> createNoUpdateMessage()
 
 std::vector<uint8_t> createUpdateMessage(const glm::mat4& inv_view_projection,
                                          const torch::Tensor& encoded_jpeg,
-                                         const torch::Tensor& encoded_depth)
+                                         const torch::Tensor& encoded_depth,
+                                         const uint32_t frame_idx)
 {
-    uint32_t message_size = sizeof(ProtocolHeader) + 3 * sizeof(uint32_t) + sizeof(glm::mat4) + encoded_jpeg.numel() +
-                            encoded_depth.numel();
+    uint32_t message_size = 
+        sizeof(ProtocolHeader) + 
+        3 * sizeof(uint32_t) + 
+        sizeof(uint32_t) + 
+        sizeof(glm::mat4) + 
+        encoded_jpeg.numel() +
+        encoded_depth.numel();
 
 
     std::vector<uint8_t> response(message_size);
@@ -106,6 +112,7 @@ std::vector<uint8_t> createUpdateMessage(const glm::mat4& inv_view_projection,
     std::memcpy(response.data(), &header, sizeof(ProtocolHeader));
 
     uint32_t offset = sizeof(ProtocolHeader);
+    atcg::NetworkUtils::writeInt<uint32_t>(response.data(), offset, frame_idx);
     atcg::NetworkUtils::writeBuffer(response.data(),
                                     offset,
                                     (uint8_t*)glm::value_ptr(inv_view_projection),

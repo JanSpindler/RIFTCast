@@ -15,7 +15,7 @@ namespace protocol
  * RIFTCAST_PROTOCOL_VERSION_MAJOR increases.
  */
 #define RIFTCAST_PROTOCOL_VERSION_MAJOR 1
-#define RIFTCAST_PROTOCOL_VERSION_MINOR 3
+#define RIFTCAST_PROTOCOL_VERSION_MINOR 4
 
 enum class MessageTask : int32_t
 {
@@ -116,7 +116,8 @@ std::vector<uint8_t> createNoUpdateMessage();
  */
 std::vector<uint8_t> createUpdateMessage(const glm::mat4& inv_view_projection,
                                          const torch::Tensor& encoded_jpeg,
-                                         const torch::Tensor& encoded_depth);
+                                         const torch::Tensor& encoded_depth,
+                                         const uint32_t frame_idx);
 
 /**
  * @brief Create an update message
