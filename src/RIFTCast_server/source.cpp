@@ -665,6 +665,7 @@ public:
         }
 
         auto header = rift::IO::readDatasetHeader(cmd_args[1]);
+
         // Per default: no context should be active
         main_context = atcg::Application::get()->getWindow()->getContext();
         atcg::Renderer::toggleCulling(false);
@@ -750,7 +751,7 @@ private:
 
 atcg::Application* atcg::createApplication()
 {
-    vci::interceptor::setup_logger(spdlog::level::info);    //
+    // vci::interceptor::setup_logger(spdlog::level::info);    //
 
     atcg::WindowProps props;
     props.vsync  = false;

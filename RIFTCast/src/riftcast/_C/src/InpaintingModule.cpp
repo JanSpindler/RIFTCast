@@ -1,6 +1,7 @@
 #include <riftcast/InpaintingModule.h>
 
-#ifndef _WIN32
+#define RIFT_WIN32
+#ifndef RIFT_WIN32
     #include <torch/csrc/inductor/aoti_runner/model_container_runner_cuda.h>
 #endif
 #include <torch/torch.h>
@@ -16,7 +17,7 @@ public:
 
     void init(const std::string& base_path);
 
-#ifndef _WIN32
+#ifndef RIFT_WIN32
     atcg::ref_ptr<torch::inductor::AOTIModelContainerRunnerCuda> runner_single;
     atcg::ref_ptr<torch::inductor::AOTIModelContainerRunnerCuda> runner_memory;
 #endif
@@ -36,7 +37,7 @@ InpaintingModule::InpaintingModule()
 
 void InpaintingModule::Impl::init(const std::string& base_path)
 {
-#ifndef _WIN32
+#ifndef RIFT_WIN32
     runner_single = atcg::make_ref<torch::inductor::AOTIModelContainerRunnerCuda>(base_path + "/single/"
                                                                                               "model_single.so");
     runner_memory = atcg::make_ref<torch::inductor::AOTIModelContainerRunnerCuda>(base_path + "/memory/"
@@ -54,7 +55,7 @@ InpaintingModule::InpaintingModule(const std::string& base_path) : InpaintingMod
 
 torch::Tensor InpaintingModule::inpaint(const torch::Tensor& image, const torch::Tensor& mask)
 {
-#ifndef _WIN32
+#ifndef RIFT_WIN32
     torch::Tensor img_tensor  = image;
     torch::Tensor mask_tensor = mask;
 
