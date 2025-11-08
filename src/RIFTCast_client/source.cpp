@@ -58,7 +58,7 @@ public:
             return {};
         }
 
-        if(header.task == rift::protocol::MessageTask::NO_UPDATE) return {};
+        if(header.task == rift::protocol::MessageTask::NO_UPDATE) return {{}, -1u};
 
         bandwidth_logger.logSample(received_data.size());
 
@@ -105,7 +105,7 @@ public:
                 auto [current_vertices_local, frame_idx] =
                     request_vertices(current_view, current_projection, current_width, current_height);
                 current_vertices = current_vertices_local;
-                mesh_frame_idx   = frame_idx;
+                if(frame_idx != -1) mesh_frame_idx   = frame_idx;
                 done             = true;
             }
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
@@ -137,25 +137,6 @@ public:
 
             // SMPL-X
             {
-                // Load SMPL-X mesh and set current frame
-                if(smplx_graphs.size() <= mesh_frame_idx)
-                {
-                    smplx_graphs.resize(mesh_frame_idx + 1);
-                    smplx_graphs[mesh_frame_idx] = nullptr;
-                }
-                if(smplx_graphs[mesh_frame_idx] == nullptr)
-                {
-                    for(size_t frame_idx = 0; frame_idx < smplx_graphs.size(); ++frame_idx)
-                    {
-                        if(smplx_graphs[frame_idx] == nullptr)
-                        {
-                            const std::string mesh_path =
-                                "/data/jspindle/meshes/smplest_x_mesh_" + std::to_string(frame_idx) + ".obj";
-                            std::cout << "Loading mesh: " << mesh_path << std::endl;
-                            smplx_graphs[frame_idx] = atcg::IO::read_mesh(mesh_path);
-                        }
-                    }
-                }
                 auto& geometry = mesh_entity.getComponent<atcg::GeometryComponent>();
                 geometry.graph = smplx_graphs[mesh_frame_idx];
 
@@ -267,6 +248,7 @@ public:
     {
         atcg::Application::get()->enableDockSpace(false);
         atcg::Renderer::setClearColor(glm::vec4(1));
+        atcg::Renderer::toggleCulling(false);
 
         auto t  = std::time(nullptr);
         auto tm = *std::localtime(&t);
@@ -285,14 +267,33 @@ public:
 
         if(!parse_success) return;
 
-        scene = atcg::make_ref<atcg::Scene>();
+        scene = atcg::IO::read_scene("../../british_museum/british_museum.obj");    // atcg::make_ref<atcg::Scene>();
+
+        {
+            auto view = scene->getAllEntitiesWith<atcg::MeshRenderComponent>();
+            for(auto e: view)
+            {
+                atcg::Entity entity(e, scene.get());
+
+                auto& component  = entity.getComponent<atcg::MeshRenderComponent>();
+                component.shader = atcg::ShaderManager::getShader("flat");
+            }
+        }
 
         if(arguments.skybox)
         {
-            auto skybox = atcg::IO::imread("res/skybox_vci.hdr");
+            auto skybox = atcg::IO::imread("../../british_museum/table_mountain_2_puresky_4k.hdr");
             scene->setSkybox(skybox);
         }
 
+        smplx_graphs.resize(251);
+        for(size_t frame_idx = 0; frame_idx < 251; ++frame_idx)
+        {
+            const std::string mesh_path =
+                "./res/meshes/smplest_x_mesh_" + std::to_string(frame_idx) + ".obj";
+            std::cout << "Loading mesh: " << mesh_path << std::endl;
+            smplx_graphs[frame_idx] = (atcg::IO::read_mesh(mesh_path));
+        }
         {
             mesh_entity = scene->createEntity("SMPL-X Mesh");
             mesh_entity.addComponent<atcg::TransformComponent>();
@@ -461,7 +462,7 @@ public:
 
             if(render_cad)
             {
-                atcg::Renderer::drawCADGrid(camera_controller->getCamera());
+                atcg::Renderer::drawCADGrid(controller->getCameraLeft());
             }
 
             if(controller->inMovement())
@@ -481,7 +482,7 @@ public:
 
             if(render_cad)
             {
-                atcg::Renderer::drawCADGrid(camera_controller->getCamera());
+                atcg::Renderer::drawCADGrid(controller->getCameraRight());
             }
 
             // atcg::Renderer::drawCADGrid(controller->getCameraRight());
