@@ -27,7 +27,7 @@
 #include <riftcast/RenderModule.h>
 #include <riftcast/InpaintingModule.h>
 
-#include <interceptor/logging.h>
+//#include <interceptor/logging.h>
 
 struct ClientState
 {
