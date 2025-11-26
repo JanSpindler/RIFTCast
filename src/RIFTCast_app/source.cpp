@@ -25,10 +25,101 @@
 #include <riftcast/RenderModule.h>
 #include <riftcast/riftcastkernels.h>
 
+#include <Python.h>
+#include <string>
+#include <unistd.h>
+
 #ifndef ATCG_HEADLESS
     #include <implot.h>
 #endif
 
+class PythonInterpreter {
+    public:
+        PythonInterpreter() {
+            Py_Initialize();
+            addCurrentDirToPath();
+            mainThreadState = PyEval_SaveThread();
+        }
+        
+        ~PythonInterpreter() {
+            PyEval_RestoreThread(mainThreadState);
+            Py_Finalize();
+        }
+        
+    private:
+        PyThreadState* mainThreadState;
+        void addCurrentDirToPath() {
+            // Get current working directory
+            char cwd[1024];
+            if (getcwd(cwd, sizeof(cwd)) != NULL) {
+                std::cout << "Adding to Python path: " << cwd << std::endl;
+                
+                // Add current directory to sys.path at the beginning
+                PyObject* sysPath = PySys_GetObject("path");  // Borrowed reference
+                PyObject* currentDir = PyUnicode_FromString(cwd);
+                PyList_Insert(sysPath, 0, currentDir);  // Insert at position 0 (highest priority)
+                Py_DECREF(currentDir);
+            }
+        }
+    };
+    
+    // TODO: Having to call this for each frame doesnt make sense there any way to make this more efficient
+    void example1_simple_call() {
+        
+        PyObject* pModule = nullptr;
+        PyObject* pFunc = nullptr;
+        PyObject* pArgs = nullptr;
+        PyObject* pValue = nullptr;
+        
+        PyObject* pModuleName = PyUnicode_DecodeFSDefault("test_module"); // Import the module
+        pModule = PyImport_Import(pModuleName);
+        Py_DECREF(pModuleName);
+        
+        if (pModule == nullptr) {
+            PyErr_Print();
+            std::cerr << "Failed to load module" << std::endl;
+            return;
+        }
+        
+        std::cout << "Module loaded successfully" << std::endl;
+        
+        // Get the function from the module
+        pFunc = PyObject_GetAttrString(pModule, "test_function");
+        
+        if (pFunc == nullptr || !PyCallable_Check(pFunc)) {
+            if (PyErr_Occurred())
+                PyErr_Print();
+            std::cerr << "Cannot find function 'test_function'" << std::endl;
+            Py_XDECREF(pFunc);
+            Py_DECREF(pModule);
+            return;
+        }
+        
+        // Prepare arguments
+        pArgs = PyTuple_New(2);
+        PyTuple_SetItem(pArgs, 0, PyUnicode_FromString("Alice"));  // Steals reference
+        PyTuple_SetItem(pArgs, 1, PyLong_FromLong(25));            // Steals reference
+        
+        // Call the function
+        pValue = PyObject_CallObject(pFunc, pArgs);
+        Py_DECREF(pArgs);
+        
+        if (pValue == nullptr) {
+            PyErr_Print();
+            std::cerr << "Function call failed" << std::endl;
+        } else {
+            // Convert result to C++ string
+            const char* result = PyUnicode_AsUTF8(pValue);
+            if (result != nullptr) {
+                std::cout << "Result from Python: " << result << std::endl;
+            }
+            Py_DECREF(pValue);
+        }
+        
+        Py_DECREF(pFunc);
+        Py_DECREF(pModule);
+    }
+    
 class RIFTCastLayer : public atcg::Layer
 {
 public:
@@ -42,6 +133,7 @@ public:
 
         // geometry_module.reset();
         // render_module.reset();
+        python_interpreter.reset();
         atcg::Renderer::use();
     }
 
@@ -68,8 +160,11 @@ public:
                 output_primitives = reconstruction.visible_primitives;
                 current_frame     = dataloader->getLastAvailableFrame();
             }
-
-
+            
+            PyGILState_STATE gstate = PyGILState_Ensure();
+            example1_simple_call();
+            PyGILState_Release(gstate);
+    
             delta_time = timer.elapsedSeconds();
 
             {
@@ -228,7 +323,7 @@ public:
                 {
                     if (smplx_graphs[frame_idx] == nullptr) 
                     {
-                        const std::string mesh_path = "/data/jspindle/meshes/smplest_x_mesh_" + std::to_string(frame_idx) + ".obj";
+                        const std::string mesh_path = "./res/meshes/smplest_x_mesh_" + std::to_string(frame_idx) + ".obj";
                         std::cout << "Loading mesh: " << mesh_path << std::endl;
                         smplx_graphs[frame_idx] = atcg::IO::read_mesh(mesh_path);
                     }
@@ -255,6 +350,8 @@ public:
     // This is run at the start of the program
     virtual void onAttach() override
     {
+        python_interpreter = std::make_unique<PythonInterpreter>();
+
         atcg::Application::get()->enableDockSpace(true);
         atcg::Renderer::setClearColor(glm::vec4(0, 0, 0, 1));
         atcg::Renderer::toggleCulling(false);
@@ -696,6 +793,8 @@ public:
 #endif
 
 private:
+    std::unique_ptr<PythonInterpreter> python_interpreter;
+
     float time_passed                                 = 0.0f;
     float reconstruction_time                         = 0.0f;
     float mapping_time                                = 0.0f;

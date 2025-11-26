@@ -2,6 +2,8 @@
 /build_linux/*
 /build_python/*
 /bin/*
+env/
+/backups/*
 imgui.ini
 .vscode/*
 __pycache__
