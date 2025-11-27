@@ -1,5 +1,5 @@
 import numpy as np
 
-def test_function(name, age):
-    print(f"a")
+def test_function(name, frame):
+    print(f"{name}:{frame}")
     return 0

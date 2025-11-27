@@ -63,63 +63,6 @@ class PythonInterpreter {
         }
     };
     
-    // TODO: Having to call this for each frame doesnt make sense there any way to make this more efficient
-    void example1_simple_call() {
-        
-        PyObject* pModule = nullptr;
-        PyObject* pFunc = nullptr;
-        PyObject* pArgs = nullptr;
-        PyObject* pValue = nullptr;
-        
-        PyObject* pModuleName = PyUnicode_DecodeFSDefault("test_module"); // Import the module
-        pModule = PyImport_Import(pModuleName);
-        Py_DECREF(pModuleName);
-        
-        if (pModule == nullptr) {
-            PyErr_Print();
-            std::cerr << "Failed to load module" << std::endl;
-            return;
-        }
-        
-        std::cout << "Module loaded successfully" << std::endl;
-        
-        // Get the function from the module
-        pFunc = PyObject_GetAttrString(pModule, "test_function");
-        
-        if (pFunc == nullptr || !PyCallable_Check(pFunc)) {
-            if (PyErr_Occurred())
-                PyErr_Print();
-            std::cerr << "Cannot find function 'test_function'" << std::endl;
-            Py_XDECREF(pFunc);
-            Py_DECREF(pModule);
-            return;
-        }
-        
-        // Prepare arguments
-        pArgs = PyTuple_New(2);
-        PyTuple_SetItem(pArgs, 0, PyUnicode_FromString("Alice"));  // Steals reference
-        PyTuple_SetItem(pArgs, 1, PyLong_FromLong(25));            // Steals reference
-        
-        // Call the function
-        pValue = PyObject_CallObject(pFunc, pArgs);
-        Py_DECREF(pArgs);
-        
-        if (pValue == nullptr) {
-            PyErr_Print();
-            std::cerr << "Function call failed" << std::endl;
-        } else {
-            // Convert result to C++ string
-            const char* result = PyUnicode_AsUTF8(pValue);
-            if (result != nullptr) {
-                std::cout << "Result from Python: " << result << std::endl;
-            }
-            Py_DECREF(pValue);
-        }
-        
-        Py_DECREF(pFunc);
-        Py_DECREF(pModule);
-    }
-    
 class RIFTCastLayer : public atcg::Layer
 {
 public:
@@ -130,11 +73,76 @@ public:
         running = false;
         if(visual_hull_thread.joinable()) visual_hull_thread.join();
         if(render_thread.joinable()) render_thread.join();
+        // Clean up Python references
+        if (cached_python_function != nullptr) {
+            PyGILState_STATE gstate = PyGILState_Ensure();
+            Py_DECREF(cached_python_function);
+            Py_DECREF(cached_python_module);
+            cached_python_function = nullptr;
+            cached_python_module = nullptr;
+            PyGILState_Release(gstate);
+        }
 
         // geometry_module.reset();
         // render_module.reset();
         python_interpreter.reset();
         atcg::Renderer::use();
+    }
+
+    void initializePythonFunction() {
+        PyGILState_STATE gstate = PyGILState_Ensure();
+        
+        PyObject* pModuleName = PyUnicode_DecodeFSDefault("test_module");
+        cached_python_module = PyImport_Import(pModuleName);
+        Py_DECREF(pModuleName);
+        
+        if (cached_python_module == nullptr) {
+            PyErr_Print();
+            std::cerr << "Failed to load module" << std::endl;
+            PyGILState_Release(gstate);
+            return;
+        }
+        
+        std::cout << "Module loaded successfully" << std::endl;
+        
+        cached_python_function = PyObject_GetAttrString(cached_python_module, "test_function");
+        
+        if (cached_python_function == nullptr || ! PyCallable_Check(cached_python_function)) {
+            if (PyErr_Occurred())
+                PyErr_Print();
+            std::cerr << "Cannot find function 'test_function'" << std::endl;
+            Py_XDECREF(cached_python_function);
+            Py_DECREF(cached_python_module);
+            cached_python_function = nullptr;
+            cached_python_module = nullptr;
+        }
+        
+        PyGILState_Release(gstate);
+    }
+    
+    // Optimized: Uses cached module and function references
+    void callPythonFunction(int frame_number) {
+        if (cached_python_function == nullptr) {
+            return;  // Not initialized or failed to load
+        }
+        
+        PyObject* pArgs = PyTuple_New(2);
+        PyTuple_SetItem(pArgs, 0, PyUnicode_FromString("Frame"));
+        PyTuple_SetItem(pArgs, 1, PyLong_FromLong(frame_number));
+        
+        PyObject* pValue = PyObject_CallObject(cached_python_function, pArgs);
+        Py_DECREF(pArgs);
+        
+        if (pValue == nullptr) {
+            PyErr_Print();
+            std::cerr << "Function call failed" << std::endl;
+        } else {
+            const char* result = PyUnicode_AsUTF8(pValue);
+            if (result != nullptr) {
+                std::cout << "Result from Python: " << result << std::endl;
+            }
+            Py_DECREF(pValue);
+        }
     }
 
     void visual_hull()
@@ -146,6 +154,9 @@ public:
 
         auto geometry_module = atcg::make_ref<rift::GeometryModule>();
         geometry_module->init(visual_hull_device_id, dataloader);
+
+        // Initialize Python function once
+        initializePythonFunction();
 
         float delta_time = 1.0f / 60.0f;
         while(running)
@@ -162,7 +173,7 @@ public:
             }
             
             PyGILState_STATE gstate = PyGILState_Ensure();
-            example1_simple_call();
+            callPythonFunction(current_frame);
             PyGILState_Release(gstate);
     
             delta_time = timer.elapsedSeconds();
@@ -794,6 +805,8 @@ public:
 
 private:
     std::unique_ptr<PythonInterpreter> python_interpreter;
+    PyObject* cached_python_module = nullptr;
+    PyObject* cached_python_function = nullptr;
 
     float time_passed                                 = 0.0f;
     float reconstruction_time                         = 0.0f;
