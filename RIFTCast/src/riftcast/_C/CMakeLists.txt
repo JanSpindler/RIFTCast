@@ -18,9 +18,9 @@ add_subdirectory(external/charonload)
 set(target_name RIFTCast_lib)
 charonload_add_torch_library(${target_name} STATIC)
 
-# Torchure
-add_subdirectory(external/torchure_smplx)
-target_link_libraries(${target_name} PUBLIC torchure_smplx::smplx)
+# Smplxpp
+add_subdirectory(external/smplxpp)
+target_link_libraries(${target_name} PRIVATE smplxpp)
 
 # Collect all source files in this directory
 file(GLOB_RECURSE source "include/**.h*" "src/**.c*")

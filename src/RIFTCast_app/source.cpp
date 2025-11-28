@@ -24,7 +24,6 @@
 #include <riftcast/GeometryModule.h>
 #include <riftcast/RenderModule.h>
 #include <riftcast/riftcastkernels.h>
-#include <smplx.hpp> // TODO: Add this, integrate torchure and make this work
 
 #ifndef ATCG_HEADLESS
     #include <implot.h>
@@ -229,7 +228,7 @@ public:
                 {
                     if (smplx_graphs[frame_idx] == nullptr) 
                     {
-                        const std::string mesh_path = "/data/jspindle/meshes/smplest_x_mesh_" + std::to_string(frame_idx) + ".obj";
+                        const std::string mesh_path = "./res/meshes/smplest_x_mesh_" + std::to_string(frame_idx) + ".obj";
                         std::cout << "Loading mesh: " << mesh_path << std::endl;
                         smplx_graphs[frame_idx] = atcg::IO::read_mesh(mesh_path);
                     }

@@ -1,4 +1,5 @@
 backups/
+res/
 /build/*
 /build_linux/*
 /build_python/*
