@@ -24,6 +24,7 @@
 #include <riftcast/GeometryModule.h>
 #include <riftcast/RenderModule.h>
 #include <riftcast/riftcastkernels.h>
+#include <smplx.hpp> // TODO: Add this, integrate torchure and make this work
 
 #ifndef ATCG_HEADLESS
     #include <implot.h>

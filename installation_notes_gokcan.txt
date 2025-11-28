@@ -1,0 +1,14 @@
+git clone https://github.com/Hydran00/torchure_smplx.git
+mkdir build
+cd build
+
+cmake ..  \
+    -DCMAKE_PREFIX_PATH="/home/demiralp/Downloads/libtorch" \
+    -DCMAKE_CUDA_ARCHITECTURES="89" \
+    -DCMAKE_BUILD_TYPE=Release
+
+cmake --build .  --config Release
+
+cd RIFTCast/src/riftcast/_C/external/
+git submodule add https://github.com/Hydran00/torchure_smplx.git torchure_smplx
+git submodule update --init --recursive

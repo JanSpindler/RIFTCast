@@ -1,7 +1,8 @@
+backups/
 /build/*
 /build_linux/*
 /build_python/*
-/bin/*
+Silhouette
 imgui.ini
 .vscode/*
 __pycache__
