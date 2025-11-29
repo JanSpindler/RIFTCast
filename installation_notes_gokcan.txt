@@ -1,3 +1,14 @@
+nvcc --version
+glxinfo | grep "OpenGL version"
+g++ -v
+ls /usr/local/ | grep cuda
+cmake --version
+nproc
+nvidia-smi
+hash -r
+nano ~/.bashrc
+source ~/.bashrc
+
 git clone https://github.com/Hydran00/torchure_smplx.git
 mkdir build
 cd build
@@ -12,3 +23,18 @@ cmake --build .  --config Release
 cd RIFTCast/src/riftcast/_C/external/
 git submodule add https://github.com/Hydran00/torchure_smplx.git torchure_smplx
 git submodule update --init --recursive
+
+
+export SMPLX_DIR=/home/demiralp/Desktop/RIFTCast/res/models/smplx
+sudo ln -s /usr/lib/x86_64-linux-gnu/libglfw.so /usr/lib/x86_64-linux-gnu/libglfw3.so
+
+
+#riftcast
+cmake --preset RIFTCast_app-Debug -DCMAKE_CUDA_HOST_COMPILER=/usr/bin/g++-12
+
+#smplxpp
+cmake .. \
+  -DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc \
+  -DCMAKE_CUDA_HOST_COMPILER=/usr/bin/g++-12
+
+export CPLUS_INCLUDE_PATH=/usr/include:/usr/include/GL

@@ -13,6 +13,6 @@
 [submodule "RIFTCast/src/riftcast/_C/external/maskcompression"]
 	path = RIFTCast/src/riftcast/_C/external/maskcompression
 	url = https://github.com/DerAndereDomenic/maskcompression.git
-[submodule "RIFTCast/src/riftcast/_C/external/smplxpp"]
-	path = RIFTCast/src/riftcast/_C/external/smplxpp
-	url = https://github.com/sxyu/smplxpp
+[submodule "RIFTCast/src/riftcast/_C/external/torchure_smplx"]
+	path = RIFTCast/src/riftcast/_C/external/torchure_smplx
+	url = https://github.com/Hydran00/torchure_smplx
