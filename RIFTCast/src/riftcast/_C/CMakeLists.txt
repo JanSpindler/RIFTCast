@@ -23,8 +23,8 @@ add_subdirectory(external/torchure_smplx)
 target_link_libraries(${target_name} PUBLIC torchure_smplx::smplx)
 
 # Smplxpp
-add_subdirectory(external/smplxpp)
-target_link_libraries(${target_name} PRIVATE smplxpp)
+# add_subdirectory(external/smplxpp)
+# target_link_libraries(${target_name} PRIVATE smplxpp)
 
 # Collect all source files in this directory
 file(GLOB_RECURSE source "include/**.h*" "src/**.c*")

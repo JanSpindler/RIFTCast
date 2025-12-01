@@ -18,3 +18,4 @@ inpainting
 /res/meshes
 /res/bonn_tele_bench_001/
 vci-gpu1-build-cmd.sh
+/bin

@@ -29,6 +29,19 @@
     #include <implot.h>
 #endif
 
+#include <pybind11/embed.h>
+#include <pybind11/numpy.h>
+#include <pybind11/stl.h>
+
+namespace py = pybind11;
+
+py::array_t<float> tensor_to_numpy(torch::Tensor t)
+{
+    t = t.to(torch::kCPU).to(torch::kFloat32).contiguous();
+    std::vector<size_t> shape(t.sizes().begin(), t.sizes().end());
+    return py::array_t<float>(shape, t.data_ptr<float>());
+}
+
 class RIFTCastLayer : public atcg::Layer
 {
 public:
@@ -217,25 +230,25 @@ public:
         if(vertices.numel() > 0)
         {
             // Load SMPL-X mesh and set current frame
-            if (smplx_graphs.size() <= mesh_frame_idx_local) 
-            {
-                smplx_graphs.resize(mesh_frame_idx_local + 1); 
-                smplx_graphs[mesh_frame_idx_local] = nullptr;
-            }
-            if (smplx_graphs[mesh_frame_idx_local] == nullptr)
-            {
-                for (size_t frame_idx = 0; frame_idx < smplx_graphs.size(); ++frame_idx) 
-                {
-                    if (smplx_graphs[frame_idx] == nullptr) 
-                    {
-                        const std::string mesh_path = "./res/meshes/smplest_x_mesh_" + std::to_string(frame_idx) + ".obj";
-                        std::cout << "Loading mesh: " << mesh_path << std::endl;
-                        smplx_graphs[frame_idx] = atcg::IO::read_mesh(mesh_path);
-                    }
-                }
-            }
-            auto& geometry = mesh_entity.getComponent<atcg::GeometryComponent>();
-            geometry.graph = smplx_graphs[mesh_frame_idx_local];
+            // if (smplx_graphs.size() <= mesh_frame_idx_local) 
+            // {
+            //     smplx_graphs.resize(mesh_frame_idx_local + 1); 
+            //     smplx_graphs[mesh_frame_idx_local] = nullptr;
+            // }
+            // if (smplx_graphs[mesh_frame_idx_local] == nullptr)
+            // {
+            //     for (size_t frame_idx = 0; frame_idx < smplx_graphs.size(); ++frame_idx) 
+            //     {
+            //         if (smplx_graphs[frame_idx] == nullptr) 
+            //         {
+            //             const std::string mesh_path = "./res/meshes/smplest_x_mesh_" + std::to_string(frame_idx) + ".obj";
+            //             std::cout << "Loading mesh: " << mesh_path << std::endl;
+            //             smplx_graphs[frame_idx] = atcg::IO::read_mesh(mesh_path);
+            //         }
+            //     }
+            // }
+            // auto& geometry = mesh_entity.getComponent<atcg::GeometryComponent>();
+            // geometry.graph = smplx_graphs[mesh_frame_idx_local];
 
             // Update SMPL-X translation for moving out of origin
             auto& transform = mesh_entity.getComponent<atcg::TransformComponent>();
@@ -255,6 +268,19 @@ public:
     // This is run at the start of the program
     virtual void onAttach() override
     {
+        // Init python
+        {
+            // Add scrypts folder to python
+            py::module_ sys = py::module_::import("sys");
+            sys.attr("path").attr("append")("SMPLest-X");
+
+            // Import script
+            py::module_ script = py::module_::import("main.vci_server");
+
+            // Create reconstructor
+            smplx_reconstructor = script.attr("create_reconstructor")();
+        }        
+
         atcg::Application::get()->enableDockSpace(true);
         atcg::Renderer::setClearColor(glm::vec4(0, 0, 0, 1));
         atcg::Renderer::toggleCulling(false);
@@ -316,7 +342,7 @@ public:
             mesh_entity     = scene->createEntity("SMPL-X Mesh");
             auto& transform = mesh_entity.addComponent<atcg::TransformComponent>();
             mesh_entity.addComponent<atcg::GeometryComponent>(nullptr);
-            auto& renderer = mesh_entity.addComponent<atcg::MeshRenderComponent>();
+            // auto& renderer = mesh_entity.addComponent<atcg::MeshRenderComponent>();
         }
 
         auto f = pfd::open_file("Choose scene meta file", pfd::path::home(), {"Json", "*.json"}, pfd::opt::none);
@@ -721,6 +747,7 @@ private:
     atcg::Entity mesh_entity;
     std::vector<atcg::ref_ptr<atcg::Graph>> smplx_graphs;
     uint32_t mesh_frame_idx = 0;
+    py::object smplx_reconstructor;
 
     atcg::ref_ptr<rift::DatasetImporter> dataloader;
     // atcg::ref_ptr<rift::GeometryModule> geometry_module;
