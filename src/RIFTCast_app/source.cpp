@@ -147,6 +147,60 @@ public:
 
             render_module->updateState(reconstruction, camera, width, height);
 
+            // SMPL-X reconstruction
+            {
+                torch::Tensor cam_valid = render_module->getChosenCameraIndices();
+                auto cam_valid_cpu = cam_valid.to(torch::kCPU);
+                auto cam_valid_accessor = cam_valid_cpu.accessor<int,1>();
+
+                // Build list of selected camera IDs in order
+                std::vector<int> selected_cam_id_list;
+                for (int i = 0; i < cam_valid_cpu.size(0); ++i)
+                {
+                    if (cam_valid_accessor[i] == 1) 
+                    {
+                        selected_cam_id_list.push_back(i);
+                    }
+                }
+
+                // Get images (this returns them in the order they were selected)
+                torch::Tensor selected_images = render_module->getSelectedCamerasImages();
+                
+                // Build images dict
+                py::dict images_dict;
+                for (int idx = 0; idx < selected_cam_id_list.size(); ++idx)
+                {
+                    int cam_id = selected_cam_id_list[idx];
+                    torch::Tensor img_tensor = selected_images[idx];  // ✓ This is correct
+                    images_dict[py::str(std::to_string(cam_id))] = tensor_to_numpy(img_tensor);
+                }
+
+                // Build Python list for selected_cam_ids
+                py::list selected_cam_ids;
+                for (int cam_id : selected_cam_id_list)
+                {
+                    selected_cam_ids.append(cam_id);
+                }
+
+                py::object result_obj = smplx_reconstructor.attr("process_frame")(images_dict, selected_cam_ids);
+                
+                // if (!result_obj.is_none())
+                // {
+                //     py::dict result = result_obj.cast<py::dict>();
+                    
+                //     auto global_orient_np = result["global_orient"].cast<py::array_t<float>>();
+                //     auto body_pose_np = result["body_pose"].cast<py::array_t<float>>();
+                //     auto betas_np = result["betas"].cast<py::array_t<float>>();
+                //     auto transl_np = result["transl"].cast<py::array_t<float>>();
+                //     auto left_hand_pose_np = result["left_hand_pose"].cast<py::array_t<float>>();
+                //     auto right_hand_pose_np = result["right_hand_pose"].cast<py::array_t<float>>();
+                //     auto jaw_pose_np = result["jaw_pose"].cast<py::array_t<float>>();
+                //     auto expression_np = result["expression"].cast<py::array_t<float>>();
+                    
+                //     // Use the SMPL-X parameters...
+                // }
+            }
+
             auto framebuffer = render_module->renderFrame(camera);
 
             // 5. Encode image
@@ -279,6 +333,10 @@ public:
 
             // Create reconstructor
             smplx_reconstructor = script.attr("create_reconstructor")();
+
+            // Init session
+            std::string vci_dir = "/data/jspindle/vci_data";
+            smplx_reconstructor.attr("initialize_session")(vci_dir);
         }        
 
         atcg::Application::get()->enableDockSpace(true);

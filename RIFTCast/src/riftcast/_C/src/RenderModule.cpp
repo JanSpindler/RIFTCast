@@ -404,6 +404,19 @@ atcg::ref_ptr<atcg::ShaderManagerSystem> RenderModule::getShaderManager() const
     return impl->shader_manager;
 }
 
+torch::Tensor RenderModule::getSelectedCamerasImages() const
+{
+    // The texture already contains only the selected cameras' images
+    // in the order they were selected (indices 0, 1, 2)
+    auto texture_data = impl->rgb_textures->getData(atcg::GPU);
+    
+    // texture_data is (NUM_CAMERAS=3, height, width, 4) RGBA
+    // Extract RGB channels only
+    auto selected_images = texture_data.index({"...", torch::indexing::Slice(0, NUM_CAMERAS)});
+    
+    return selected_images.contiguous();
+}
+
 void RenderModule::setBackgroundColor(const glm::vec4& color)
 {
     impl->clear_color = color;

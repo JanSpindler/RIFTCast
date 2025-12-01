@@ -82,6 +82,13 @@ public:
     atcg::ref_ptr<atcg::ShaderManagerSystem> getShaderManager() const;
 
     /**
+     * @brief Get the images of the selected cameras as a tensor
+     *
+     * @return The tensor
+     */
+    torch::Tensor getSelectedCamerasImages() const;
+
+    /**
      * @brief Set the background color
      *
      * @param color The background color
