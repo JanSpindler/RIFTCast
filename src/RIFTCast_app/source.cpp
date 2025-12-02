@@ -25,9 +25,55 @@
 #include <riftcast/RenderModule.h>
 #include <riftcast/riftcastkernels.h>
 
+#include <smplx.hpp>
 #ifndef ATCG_HEADLESS
     #include <implot.h>
 #endif
+
+struct SmplOutput {
+    torch::Tensor global_orient;
+    torch::Tensor body_pose;
+    torch::Tensor betas;
+    torch::Tensor transl;
+};
+
+SmplOutput convert_smplx_params_to_smpl(
+    const torch::Tensor& fullpose_smplx, // Shape: (B, 165)
+    const torch::Tensor& betas_smplx,    // Shape: (B, 300)
+    const torch::Tensor& transl_smplx    // Shape: (B, 3)
+) {
+    namespace F = torch::indexing;
+    
+    // Reshape fullpose to (Batch, 55 joints, 3 rot params) to make slicing easier
+    // 55 joints = 1 global + 21 body + 2 hands + others (face/feet/etc)
+    auto fullpose_reshaped = fullpose_smplx.reshape({-1, 55, 3});
+
+
+    auto global_orient_smpl = fullpose_reshaped.index({F::Slice(), 0}); // Shape (B, 3)
+    auto body_pose_x = fullpose_reshaped.index({F::Slice(), F::Slice(1, 22)}); 
+    auto left_wrist = fullpose_reshaped.index({F::Slice(), F::Slice(25, 26)});
+    auto right_wrist = fullpose_reshaped.index({F::Slice(), F::Slice(40, 41)});
+    auto body_pose_smpl_composed = torch::cat({body_pose_x, left_wrist, right_wrist}, 1);
+    auto body_pose_smpl_flat = body_pose_smpl_composed.reshape({body_pose_smpl_composed.size(0), -1});
+
+
+    // Python: betas_smpl = betas_smplx[:, :300]
+    auto betas_smpl = betas_smplx.index({F::Slice(), F::Slice(0, 300)}).clone();
+
+    // Update Beta 0 and 1
+    auto b0_input = betas_smpl.index({F::Slice(), 0});
+    auto b1_input = betas_smpl.index({F::Slice(), 1});
+    betas_smpl.index_put_({F::Slice(), 0}, (0.6826095)*b0_input - (0.1245366)*b1_input - (0.0792477));
+    betas_smpl.index_put_({F::Slice(), 1}, (0.0182429)*b0_input + (0.3093621)*b1_input + (0.0447035));
+
+    // Handle Translation
+    auto transl_smpl = transl_smplx.clone();
+    auto beta0_original = betas_smplx.index({F::Slice(), 0});
+    auto y_offset = (0.00888539)*beta0_original + (1.15908373);
+    transl_smpl.index_put_({F::Slice(), 1}, transl_smpl.index({F::Slice(), 1}) + y_offset);
+
+    return {global_orient_smpl, body_pose_smpl_flat, betas_smpl, transl_smpl};
+}
 
 class RIFTCastLayer : public atcg::Layer
 {
@@ -275,30 +321,16 @@ public:
             rift::unprojectVertices(output_img, inv_view_projection, output_depth, output_normals);
         if(vertices.numel() > 0)
         {
-            // Load SMPL-X mesh and set current frame
-            if (smplx_graphs.size() <= mesh_frame_idx_local) 
-            {
-                smplx_graphs.resize(mesh_frame_idx_local + 1); 
-                smplx_graphs[mesh_frame_idx_local] = nullptr;
-            }
-            if (smplx_graphs[mesh_frame_idx_local] == nullptr)
-            {
-                for (size_t frame_idx = 0; frame_idx < smplx_graphs.size(); ++frame_idx) 
-                {
-                    if (smplx_graphs[frame_idx] == nullptr) 
-                    {
-                        const std::string mesh_path = "./res/meshes/smplest_x_mesh_" + std::to_string(frame_idx) + ".obj";
-                        std::cout << "Loading mesh: " << mesh_path << std::endl;
-                        smplx_graphs[frame_idx] = atcg::IO::read_mesh(mesh_path);
-                    }
-                }
-            }
-            auto& geometry = mesh_entity.getComponent<atcg::GeometryComponent>();
-            geometry.graph = smplx_graphs[mesh_frame_idx_local];
+            // Create and update the SMPL mesh for the current frame using torchure_smplx
+            auto smplx_graph = computeSMPLXMesh(mesh_frame_idx_local);
 
-            // Update SMPL-X translation for moving out of origin
+            auto& geometry = mesh_entity.getComponent<atcg::GeometryComponent>();
+            geometry.graph = smplx_graph;
+
+            // Place the mesh in the scene (simple translation over time)
             auto& transform = mesh_entity.getComponent<atcg::TransformComponent>();
-            transform.setPosition(glm::vec3(1.0f, 0.0f, 1.0f) * static_cast<float>(mesh_frame_idx_local) * 0.005f + glm::vec3(-0.35f, 0.0f, -0.25f));
+            transform.setPosition(glm::vec3(1.0f, 0.0f, 1.0f) * static_cast<float>(mesh_frame_idx_local) * 0.005f
+                                  + glm::vec3(-0.35f, 0.0f, -0.25f));
 
             // Point cloud
             pointcloud->resizeVertices(vertices.size(0));
@@ -371,11 +403,14 @@ public:
         auto skybox = atcg::IO::imread("res/skybox_vci.hdr");
         scene->setSkybox(skybox);
 
+        initializeSMPLX();
+
         {
-            mesh_entity     = scene->createEntity("SMPL-X Mesh");
+            mesh_entity     = scene->createEntity("SMPL Mesh");
             auto& transform = mesh_entity.addComponent<atcg::TransformComponent>();
             mesh_entity.addComponent<atcg::GeometryComponent>(nullptr);
             auto& renderer = mesh_entity.addComponent<atcg::MeshRenderComponent>();
+            (void)renderer;
         }
 
         auto f = pfd::open_file("Choose scene meta file", pfd::path::home(), {"Json", "*.json"}, pfd::opt::none);
