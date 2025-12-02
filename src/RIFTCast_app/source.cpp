@@ -170,6 +170,65 @@ public:
         render_module.reset();
     }
 
+    // Helper function to compute SMPL mesh for the current frame (Hydran00/torchure_smplx API)
+    atcg::ref_ptr<atcg::Graph> computeSMPLXMesh(uint32_t /*frame_idx*/)
+    {
+        torch::NoGradGuard no_grad;
+        auto opts_f32_gpu = torch::TensorOptions().dtype(torch::kFloat32).device(atcg::GPU);
+        torch::Tensor default_smplx_betas = torch::zeros({1, 300}, torch::TensorOptions().dtype(torch::kFloat32).device(atcg::GPU));
+        torch::Tensor default_smplx_fullpose = torch::zeros({1, 55 * 3}, torch::TensorOptions().dtype(torch::kFloat32).device(atcg::GPU));
+        torch::Tensor default_smplx_transl = torch::zeros({1, 3}, torch::TensorOptions().dtype(torch::kFloat32).device(atcg::GPU));
+        
+        // Call the converter function
+        SmplOutput smpl_out = convert_smplx_params_to_smpl(
+            default_smplx_fullpose,
+            default_smplx_betas,
+            default_smplx_transl
+        );
+
+        // Forward pass with default parameters (recomputes mesh each frame)
+        auto output = smplx_model->forward(
+            smplx::betas(smpl_out.betas),
+            smplx::body_pose(smpl_out.body_pose),
+            smplx::global_orient(smpl_out.global_orient),
+            smplx::transl(smpl_out.transl),
+            smplx::return_verts(true)
+        );
+
+        if (!output.vertices.has_value())
+        {
+            // Fallback: return the persistent graph (already allocated) even if we didn’t update this frame
+            return smpl_graph_ ? smpl_graph_ : atcg::Graph::createTriangleMesh();
+        }
+    
+        // verts: [V, 3] float32 on GPU
+        torch::Tensor verts = output.vertices.value().squeeze(0).to(torch::kFloat32).to(atcg::GPU);
+    
+        // Compute vertex normals using precomputed i0/i1/i2 (all on GPU)
+        torch::Tensor v0 = verts.index({smpl_i0_});
+        torch::Tensor v1 = verts.index({smpl_i1_});
+        torch::Tensor v2 = verts.index({smpl_i2_});
+    
+        torch::Tensor fn = torch::cross(v1 - v0, v2 - v0, /*dim=*/1); // [F,3]
+        torch::Tensor vn = torch::zeros({smpl_V_, 3}, opts_f32_gpu);
+        vn.index_add_(0, smpl_i0_, fn);
+        vn.index_add_(0, smpl_i1_, fn);
+        vn.index_add_(0, smpl_i2_, fn);
+    
+        torch::Tensor vn_unit = vn / torch::clamp(torch::sqrt((vn * vn).sum(1, true)), 1e-9f);
+    
+        // Write into the Graph’s GPU buffers directly (no [V,15] pack, no reallocs)
+        // Positions
+        smpl_graph_->getDevicePositions().index_put_({torch::indexing::Slice(), torch::indexing::Slice()}, verts);
+        // Normals
+        smpl_graph_->getDeviceNormals().index_put_({torch::indexing::Slice(), torch::indexing::Slice()}, vn_unit);
+        // Colors/UV/Tangent were set once at init; update if you need dynamic values
+    
+        smpl_graph_->unmapDeviceVertexPointer(); // Unmap after writes (mirrors pointcloud usage)
+    
+        return smpl_graph_;
+    }
+
     void updateReconstruction()
     {
         atcg::Timer timer;
@@ -382,6 +441,75 @@ public:
         running            = true;
         visual_hull_thread = std::thread(&RIFTCastLayer::visual_hull, this);
         render_thread      = std::thread(&RIFTCastLayer::render, this);
+    }
+
+    // Initialize SMPL model with defaults, adapted to Hydran00/torchure_smplx behavior
+    void initializeSMPLX()
+    {
+        // Path to SMPL model file (.npz as used in torchure_smplx)
+        const char* smplx_model_path = "./res/models/smpl/SMPL_NEUTRAL.npz";
+
+        // Create model instance
+        smplx_model = std::make_unique<smplx::SMPL>(
+            smplx_model_path,
+            atcg::GPU,
+            smplx::batch_size(1)
+        );
+
+        // Ensure model parameters are float while index buffers remain integer types, mirroring smplx_test.cpp
+        smplx_model->to(torch::kFloat);
+        for (auto& buffer : smplx_model->named_buffers())
+        {
+            const std::string& name = buffer.key();
+            if (name.find("parents") != std::string::npos ||
+                name.find("faces")   != std::string::npos ||
+                name.find("kintree") != std::string::npos)
+            {
+                buffer.value().set_data(buffer.value().to(torch::kLong));
+            }
+        }
+        smplx_model->to(atcg::GPU);
+    
+        {
+            // Faces are constant: keep them on GPU (int32) and contiguous
+            smpl_faces_gpu_ = smplx_model->faces().to(torch::kInt32).to(atcg::GPU).contiguous();
+            smpl_F_ = smpl_faces_gpu_.size(0);
+    
+            // Do one cheap forward to find V (number of vertices)
+            torch::NoGradGuard no_grad;
+            auto Zf = torch::zeros({1, 55 * 3}, torch::TensorOptions().dtype(torch::kFloat32).device(atcg::GPU));
+            auto Zb = torch::zeros({1, 300}, torch::TensorOptions().dtype(torch::kFloat32).device(atcg::GPU));
+            auto Zt = torch::zeros({1, 3},   torch::TensorOptions().dtype(torch::kFloat32).device(atcg::GPU));
+    
+            auto smpl_in = convert_smplx_params_to_smpl(Zf, Zb, Zt);
+            auto out0 = smplx_model->forward(
+                smplx::betas(smpl_in.betas),
+                smplx::body_pose(smpl_in.body_pose),
+                smplx::global_orient(smpl_in.global_orient),
+                smplx::transl(smpl_in.transl),
+                smplx::return_verts(true)
+            );
+            TORCH_CHECK(out0.vertices.has_value(), "SMPL forward did not return vertices at init");
+            smpl_V_ = out0.vertices.value().squeeze(0).size(0);
+    
+            // Create a Graph once, set faces once, and initialize constant attributes
+            auto opts_f32_gpu = torch::TensorOptions().dtype(torch::kFloat32).device(atcg::GPU);
+    
+            // Allocate vertex buffer on GPU (we’ll only write positions/normals per frame)
+            torch::Tensor init_vertices = torch::zeros({smpl_V_, 15}, opts_f32_gpu);
+            // Set color to white once
+            init_vertices.index_put_({torch::indexing::Slice(), torch::indexing::Slice(3, 6)}, 1.0f);
+            // Tangent/UV remain zeros
+    
+            smpl_graph_ = atcg::Graph::createTriangleMesh(init_vertices, smpl_faces_gpu_);
+            // Optional: unmap after initial fill
+            smpl_graph_->unmapDeviceVertexPointer();
+    
+            // Precompute index tensors for normals (int64 for advanced indexing)
+            smpl_i0_ = smpl_faces_gpu_.index({torch::indexing::Slice(), 0}).to(torch::kLong);
+            smpl_i1_ = smpl_faces_gpu_.index({torch::indexing::Slice(), 1}).to(torch::kLong);
+            smpl_i2_ = smpl_faces_gpu_.index({torch::indexing::Slice(), 2}).to(torch::kLong);
+        }
     }
 
     // This gets called each frame
@@ -740,6 +868,14 @@ private:
     glm::vec2 mouse_pos;
 
     atcg::ref_ptr<atcg::Graph> pointcloud;
+
+    // SMPL model and default parameters (torchure_smplx)
+    std::unique_ptr<smplx::SMPL> smplx_model;
+    // Cached SMPL topology + working buffers
+    atcg::ref_ptr<atcg::Graph> smpl_graph_;
+    torch::Tensor smpl_faces_gpu_;   // [F,3] int32, GPU
+    torch::Tensor smpl_i0_, smpl_i1_, smpl_i2_; // int64, GPU (for indexing)
+    int64_t smpl_V_ = 0, smpl_F_ = 0;
 
     // Visual hull thread
     std::thread visual_hull_thread;
