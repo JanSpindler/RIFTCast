@@ -22,9 +22,8 @@ charonload_add_torch_library(${target_name} STATIC)
 add_subdirectory(external/torchure_smplx)
 target_link_libraries(${target_name} PUBLIC torchure_smplx::smplx)
 
-# Smplxpp
-# add_subdirectory(external/smplxpp)
-# target_link_libraries(${target_name} PRIVATE smplxpp)
+# ZeroMQ
+add_subdirectory(external/cppzmq)
 
 # Collect all source files in this directory
 file(GLOB_RECURSE source "include/**.h*" "src/**.c*")
@@ -59,7 +58,8 @@ target_link_libraries(${target_name} PUBLIC atcg_lib
                                             libzstd_static 
                                             charonload::torch_python 
                                             Python::Python
-                                            HTTPRequest)
+                                            HTTPRequest
+                                            cppzmq)
 
 target_include_directories(${target_name} PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
                                                  ${PROJECT_SOURCE_DIR}/external/json)

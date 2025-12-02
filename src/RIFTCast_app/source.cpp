@@ -29,6 +29,133 @@
     #include <implot.h>
 #endif
 
+#include <zmq.hpp>
+#include <json.hpp>
+
+using json = nlohmann::json;
+
+class SMPLXClient
+{
+public:
+    SMPLXClient(const std::string& address = "tcp://localhost:5555")
+        : context(1), socket(context, zmq::socket_type::req)
+    {
+        int hwm = 10;
+        socket.setsockopt(ZMQ_SNDHWM, &hwm, sizeof(int));
+        socket.setsockopt(ZMQ_RCVHWM, &hwm, sizeof(int));
+    
+        socket.connect(address);
+        std::cout << "Connected to SMPL-X server at " << address << std::endl;
+    }
+
+    bool initialize(const std::string& vci_dir)
+    {
+        json metadata = {
+            {"command", "initialize"},
+            {"vci_dir", vci_dir}
+        };
+
+        std::string metadata_str = metadata.dump();
+        socket.send(zmq::buffer(metadata_str), zmq::send_flags::none);
+
+        zmq::message_t reply;
+        socket.recv(reply, zmq::recv_flags::none);
+
+        auto response = json::parse(std::string(static_cast<char*>(reply.data()), reply.size()));
+
+        if (response["status"] == "success")
+        {
+            std::cout << "SMPL-X session initialized successfully." << std::endl;
+            return true;
+        }
+        else
+        {
+            std::cerr << "Failed to initialize SMPL-X session: " << response["error"] << std::endl;
+            return false;
+        }
+    }
+
+    json process_frame(
+        const std::map<std::string, std::string>& image_files,
+        const std::vector<std::string>& selected_cam_ids)
+    {
+        // Build metadata
+        std::vector<std::string> cam_ids;
+        for (const auto& [cam_id, _] : image_files) 
+        {
+            cam_ids.push_back(cam_id);
+        }
+        
+        json metadata = {
+            {"command", "process_frame"},
+            {"cam_ids", cam_ids},
+            {"num_images", cam_ids.size()}
+        };
+        
+        if (!selected_cam_ids.empty()) 
+        {
+            metadata["selected_cam_ids"] = selected_cam_ids;
+        }
+        
+        // Send metadata (part 0)
+        std::string metadata_str = metadata.dump();
+        socket.send(zmq::buffer(metadata_str), zmq::send_flags::sndmore);
+        
+        // Send image data (parts 1+)
+        size_t idx = 0;
+        for (const auto& cam_id : cam_ids) 
+        {
+            const auto& filepath = image_files.at(cam_id);
+            
+            // Read file as binary
+            std::ifstream file(filepath, std::ios::binary | std::ios::ate);
+            if (!file.is_open()) 
+            {
+                throw std::runtime_error("Failed to open file: " + filepath);
+            }
+            
+            std::streamsize size = file.tellg();
+            file.seekg(0, std::ios::beg);
+            
+            std::vector<char> buffer(size);
+            if (!file.read(buffer.data(), size)) 
+            {
+                throw std::runtime_error("Failed to read file: " + filepath);
+            }
+            
+            // Send image bytes
+            zmq::send_flags flags = (idx < cam_ids.size() - 1) ? 
+                zmq::send_flags::sndmore : zmq::send_flags::none;
+            
+            socket.send(zmq::buffer(buffer), flags);
+            idx++;
+        }
+        
+        // Receive response
+        zmq::message_t reply;
+        socket.recv(reply, zmq::recv_flags::none);
+        
+        std::string reply_str(static_cast<char*>(reply.data()), reply.size());
+        return json::parse(reply_str);
+    }
+
+    void reset() 
+    {
+        json metadata = {{"command", "reset"}};
+        std::string metadata_str = metadata.dump();
+        socket.send(zmq::buffer(metadata_str), zmq::send_flags::none);
+        
+        zmq::message_t reply;
+        socket.recv(reply, zmq::recv_flags::none);
+        auto response = json::parse(std::string(static_cast<char*>(reply.data()), reply.size()));
+        std::cout << "Reset: " << response["message"] << std::endl;
+    }
+
+private:
+    zmq::context_t context;
+    zmq::socket_t socket;
+};
+
 class RIFTCastLayer : public atcg::Layer
 {
 public:
@@ -309,8 +436,10 @@ public:
     // This is run at the start of the program
     virtual void onAttach() override
     {
-        // Init python
+        // Init smplx client
         {
+            smplx_client.initialize("/data/jspindle/vci_data");
+
             // // Aquire GIL
             // py::gil_scoped_acquire acquire;
 
@@ -795,6 +924,7 @@ private:
     atcg::Entity mesh_entity;
     std::vector<atcg::ref_ptr<atcg::Graph>> smplx_graphs;
     uint32_t mesh_frame_idx = 0;
+    SMPLXClient smplx_client = SMPLXClient("tcp://localhost:5555");
 
     atcg::ref_ptr<rift::DatasetImporter> dataloader;
     // atcg::ref_ptr<rift::GeometryModule> geometry_module;
