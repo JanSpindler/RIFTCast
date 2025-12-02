@@ -76,12 +76,12 @@ public:
     }
 
     json process_frame(
-        const std::map<std::string, std::string>& image_files,
+        const std::map<std::string, torch::Tensor>& image_tensors,
         const std::vector<std::string>& selected_cam_ids)
     {
         // Build metadata
         std::vector<std::string> cam_ids;
-        for (const auto& [cam_id, _] : image_files) 
+        for (const auto& [cam_id, _] : image_tensors)
         {
             cam_ids.push_back(cam_id);
         }
@@ -103,32 +103,24 @@ public:
         
         // Send image data (parts 1+)
         size_t idx = 0;
-        for (const auto& cam_id : cam_ids) 
+        for (const std::string& cam_id : cam_ids) 
         {
-            const auto& filepath = image_files.at(cam_id);
+            // Parse tensor
+            const torch::Tensor& tensor = image_tensors.at(cam_id);
+            const torch::Tensor tensor_cpu = tensor.to(torch::kCPU).to(torch::kUInt8).contiguous();
+
+            const auto shape = tensor_cpu.sizes();
+            int height = shape[0];
+            int width  = shape[1];
+            int channels = shape[2];
             
-            // Read file as binary
-            std::ifstream file(filepath, std::ios::binary | std::ios::ate);
-            if (!file.is_open()) 
-            {
-                throw std::runtime_error("Failed to open file: " + filepath);
-            }
-            
-            std::streamsize size = file.tellg();
-            file.seekg(0, std::ios::beg);
-            
-            std::vector<char> buffer(size);
-            if (!file.read(buffer.data(), size)) 
-            {
-                throw std::runtime_error("Failed to read file: " + filepath);
-            }
+            int shape_data[3] = {height, width, channels};
+            socket.send(zmq::buffer(shape_data, sizeof(shape_data)), zmq::send_flags::sndmore);
             
             // Send image bytes
-            zmq::send_flags flags = (idx < cam_ids.size() - 1) ? 
-                zmq::send_flags::sndmore : zmq::send_flags::none;
-            
-            socket.send(zmq::buffer(buffer), flags);
-            idx++;
+            const zmq::send_flags flags = (idx < cam_ids.size() - 1) ? zmq::send_flags::sndmore : zmq::send_flags::none;
+            socket.send(zmq::buffer(tensor_cpu.data_ptr(), tensor_cpu.numel()), flags);
+            ++idx;
         }
         
         // Receive response
@@ -268,17 +260,64 @@ public:
                 auto cam_valid_cpu = cam_valid.to(torch::kCPU);
                 auto cam_valid_accessor = cam_valid_cpu.accessor<int,1>();
 
-                std::vector<int> selected_cam_id_list;
+                std::vector<int> selected_cam_indices;
                 for (int i = 0; i < cam_valid_cpu.size(0); ++i)
                 {
                     if (cam_valid_accessor[i] == 1) 
                     {
-                        selected_cam_id_list.push_back(i);
+                        selected_cam_indices.push_back(i);
                     }
                 }
 
                 // Get images (this returns them in the order they were selected)
                 torch::Tensor selected_images = render_module->getSelectedCamerasImages();
+                
+                // Get actual camera IDs from dataloader
+                const auto& cameras = dataloader->getCameras();
+                
+                // Build image tensors map (cam_id -> tensor)
+                std::map<std::string, torch::Tensor> image_tensors;
+                std::vector<std::string> selected_cam_ids_str;
+                
+                for (int idx = 0; idx < selected_cam_indices.size(); ++idx)
+                {
+                    int cam_index = selected_cam_indices[idx];
+                    std::string cam_id = std::to_string(cameras[cam_index].id);  // Get actual camera ID/name
+                    torch::Tensor img_tensor = selected_images[idx];
+                    
+                    image_tensors[cam_id] = img_tensor;
+                    selected_cam_ids_str.push_back(cam_id);
+                }
+
+                // Call SMPL-X reconstruction via ZMQ
+                try 
+                {
+                    json result = smplx_client.process_frame(image_tensors, selected_cam_ids_str);
+                    
+                    if (result.contains("status"))
+                    {
+                        if (result["status"] == "success")
+                        {
+                            std::cout << "SMPL-X reconstruction successful" << std::endl;
+                            
+                            // Extract SMPL-X parameters if needed
+                            // auto data = result["data"];
+                            // auto global_orient = data["global_orient"]; // etc.
+                        }
+                        else if (result["status"] == "no_detection")
+                        {
+                            std::cout << "No person detected in frame" << std::endl;
+                        }
+                        else if (result["status"] == "error")
+                        {
+                            std::cerr << "SMPL-X error: " << result["error"] << std::endl;
+                        }
+                    }
+                }
+                catch (const std::exception& e)
+                {
+                    std::cerr << "SMPL-X reconstruction exception: " << e.what() << std::endl;
+                }
                 
                 // Build images dict
                 // py::dict images_dict;
