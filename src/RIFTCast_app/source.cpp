@@ -29,19 +29,6 @@
     #include <implot.h>
 #endif
 
-#include <pybind11/embed.h>
-#include <pybind11/numpy.h>
-#include <pybind11/stl.h>
-
-namespace py = pybind11;
-
-py::array_t<float> tensor_to_numpy(torch::Tensor t)
-{
-    t = t.to(torch::kCPU).to(torch::kFloat32).contiguous();
-    std::vector<size_t> shape(t.sizes().begin(), t.sizes().end());
-    return py::array_t<float>(shape, t.data_ptr<float>());
-}
-
 class RIFTCastLayer : public atcg::Layer
 {
 public:
@@ -149,11 +136,11 @@ public:
 
             // SMPL-X reconstruction
             {
+                // Build list of selected camera IDs in order
                 torch::Tensor cam_valid = render_module->getChosenCameraIndices();
                 auto cam_valid_cpu = cam_valid.to(torch::kCPU);
                 auto cam_valid_accessor = cam_valid_cpu.accessor<int,1>();
 
-                // Build list of selected camera IDs in order
                 std::vector<int> selected_cam_id_list;
                 for (int i = 0; i < cam_valid_cpu.size(0); ++i)
                 {
@@ -167,22 +154,22 @@ public:
                 torch::Tensor selected_images = render_module->getSelectedCamerasImages();
                 
                 // Build images dict
-                py::dict images_dict;
-                for (int idx = 0; idx < selected_cam_id_list.size(); ++idx)
-                {
-                    int cam_id = selected_cam_id_list[idx];
-                    torch::Tensor img_tensor = selected_images[idx];  // ✓ This is correct
-                    images_dict[py::str(std::to_string(cam_id))] = tensor_to_numpy(img_tensor);
-                }
+                // py::dict images_dict;
+                // for (int idx = 0; idx < selected_cam_id_list.size(); ++idx)
+                // {
+                //     int cam_id = selected_cam_id_list[idx];
+                //     torch::Tensor img_tensor = selected_images[idx];  // ✓ This is correct
+                //     images_dict[py::str(std::to_string(cam_id))] = tensor_to_numpy(img_tensor);
+                // }
 
                 // Build Python list for selected_cam_ids
-                py::list selected_cam_ids;
-                for (int cam_id : selected_cam_id_list)
-                {
-                    selected_cam_ids.append(cam_id);
-                }
+                // py::list selected_cam_ids;
+                // for (int cam_id : selected_cam_id_list)
+                // {
+                //     selected_cam_ids.append(cam_id);
+                // }
 
-                py::object result_obj = smplx_reconstructor.attr("process_frame")(images_dict, selected_cam_ids);
+                // py::object result_obj = smplx_reconstructor.attr("process_frame")(images_dict, selected_cam_ids);
                 
                 // if (!result_obj.is_none())
                 // {
@@ -324,19 +311,22 @@ public:
     {
         // Init python
         {
-            // Add scrypts folder to python
-            py::module_ sys = py::module_::import("sys");
-            sys.attr("path").attr("append")("SMPLest-X");
+            // // Aquire GIL
+            // py::gil_scoped_acquire acquire;
 
-            // Import script
-            py::module_ script = py::module_::import("main.vci_server");
+            // // Add scrypts folder to python
+            // py::module_ sys = py::module_::import("sys");
+            // sys.attr("path").attr("append")("SMPLest-X");
 
-            // Create reconstructor
-            smplx_reconstructor = script.attr("create_reconstructor")();
+            // // Import script
+            // py::module_ script = py::module_::import("main.vci_server");
 
-            // Init session
-            std::string vci_dir = "/data/jspindle/vci_data";
-            smplx_reconstructor.attr("initialize_session")(vci_dir);
+            // // Create reconstructor
+            // smplx_reconstructor = script.attr("create_reconstructor")();
+
+            // // Init session
+            // std::string vci_dir = "/data/jspindle/vci_data";
+            // smplx_reconstructor.attr("initialize_session")(vci_dir);
         }        
 
         atcg::Application::get()->enableDockSpace(true);
@@ -805,7 +795,6 @@ private:
     atcg::Entity mesh_entity;
     std::vector<atcg::ref_ptr<atcg::Graph>> smplx_graphs;
     uint32_t mesh_frame_idx = 0;
-    py::object smplx_reconstructor;
 
     atcg::ref_ptr<rift::DatasetImporter> dataloader;
     // atcg::ref_ptr<rift::GeometryModule> geometry_module;
