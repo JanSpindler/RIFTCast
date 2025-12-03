@@ -117,7 +117,8 @@ std::vector<uint8_t> createNoUpdateMessage();
 std::vector<uint8_t> createUpdateMessage(const glm::mat4& inv_view_projection,
                                          const torch::Tensor& encoded_jpeg,
                                          const torch::Tensor& encoded_depth,
-                                         const uint32_t frame_idx);
+                                         const uint32_t frame_idx,
+                                        const std::array<float, 178>& smplx);
 
 /**
  * @brief Create an update message

@@ -29,6 +29,223 @@
 
 //#include <interceptor/logging.h>
 
+#include <zmq.hpp>
+#include <json.hpp>
+
+using json = nlohmann::json;
+
+struct SMPLXResult
+{
+    // Metadata
+    int frame_index;
+    int num_vertices;
+    int num_faces;
+    
+    // SMPL-X parameters (182 floats total)
+    std::vector<float> global_orient;      // 3 floats
+    std::vector<float> body_pose;          // 63 floats
+    std::vector<float> left_hand_pose;     // 45 floats
+    std::vector<float> right_hand_pose;    // 45 floats
+    std::vector<float> jaw_pose;           // 3 floats
+    std::vector<float> betas;              // 10 floats
+    std::vector<float> expression;         // 10 floats
+    std::vector<float> transl;             // 3 floats
+    
+    // Mesh data
+    std::vector<float> vertices;           // num_vertices * 3
+    std::vector<int32_t> faces;            // num_faces * 3
+};
+
+class SMPLXClient
+{
+public:
+    SMPLXClient(const std::string& address = "tcp://localhost:5555")
+        : context(1), socket(context, zmq::socket_type::req)
+    {
+        int hwm = 10;
+        socket.setsockopt(ZMQ_SNDHWM, &hwm, sizeof(int));
+        socket.setsockopt(ZMQ_RCVHWM, &hwm, sizeof(int));
+    
+        socket.connect(address);
+        std::cout << "Connected to SMPL-X server at " << address << std::endl;
+    }
+
+    bool initialize(const std::string& vci_dir)
+    {
+        json metadata = {
+            {"command", "initialize"},
+            {"vci_dir", vci_dir}
+        };
+
+        std::string metadata_str = metadata.dump();
+        socket.send(zmq::buffer(metadata_str), zmq::send_flags::none);
+
+        zmq::message_t reply;
+        socket.recv(reply, zmq::recv_flags::none);
+
+        auto response = json::parse(std::string(static_cast<char*>(reply.data()), reply.size()));
+
+        if (response["status"] == "success")
+        {
+            std::cout << "SMPL-X session initialized successfully." << std::endl;
+            return true;
+        }
+        else
+        {
+            std::cerr << "Failed to initialize SMPL-X session: " << response["error"] << std::endl;
+            return false;
+        }
+    }
+
+    void process_frame(
+        const std::map<std::string, torch::Tensor>& image_tensors,
+        const std::vector<std::string>& selected_cam_ids,
+        SMPLXResult& result)
+    {
+        // Build metadata
+        std::vector<std::string> cam_ids;
+        for (const auto& [cam_id, _] : image_tensors)
+        {
+            cam_ids.push_back(cam_id);
+        }
+        
+        json metadata = {
+            {"command", "process_frame"},
+            {"cam_ids", cam_ids},
+            {"num_images", cam_ids.size()}
+        };
+        
+        if (!selected_cam_ids.empty()) 
+        {
+            metadata["selected_cam_ids"] = selected_cam_ids;
+        }
+        
+        // Send metadata (part 0)
+        std::string metadata_str = metadata.dump();
+        socket.send(zmq::buffer(metadata_str), zmq::send_flags::sndmore);
+        
+        // Send image data (parts 1+)
+        size_t idx = 0;
+        for (const std::string& cam_id : cam_ids) 
+        {
+            // Parse tensor
+            const torch::Tensor& tensor = image_tensors.at(cam_id);
+            const torch::Tensor tensor_cpu = tensor.to(torch::kCPU).to(torch::kUInt8).contiguous();
+
+            const auto shape = tensor_cpu.sizes();
+            int height = shape[0];
+            int width  = shape[1];
+            int channels = shape[2];
+            
+            int shape_data[3] = {height, width, channels};
+            socket.send(zmq::buffer(shape_data, sizeof(shape_data)), zmq::send_flags::sndmore);
+            
+            // Send image bytes
+            const zmq::send_flags flags = (idx < cam_ids.size() - 1) ? zmq::send_flags::sndmore : zmq::send_flags::none;
+            socket.send(zmq::buffer(tensor_cpu.data_ptr(), tensor_cpu.numel()), flags);
+            ++idx;
+        }
+        
+        // Receive multipart response
+        std::vector<zmq::message_t> responses;
+        int more;
+        size_t more_size = sizeof(more);
+        
+        do {
+            zmq::message_t msg;
+            socket.recv(msg, zmq::recv_flags::none);
+            socket.getsockopt(ZMQ_RCVMORE, &more, &more_size);
+            responses.push_back(std::move(msg));
+        } while (more);
+        
+        if (responses.size() == 1) {
+            // Error response (JSON)
+            std::string error_str(static_cast<char*>(responses[0].data()), responses[0].size());
+            auto error_json = json::parse(error_str);
+            
+            // Return empty result on error (or could throw)
+            std::cerr << "Server error: " << error_json["message"].get<std::string>() << std::endl;
+            result.frame_index = -1;
+            result.num_vertices = 0;
+            result.num_faces = 0;
+        }
+        else if (responses.size() == 4) {
+            // Binary response
+            // Part 0: Metadata (JSON)
+            std::string metadata_str(static_cast<char*>(responses[0].data()), responses[0].size());
+            auto metadata = json::parse(metadata_str);
+            
+            result.frame_index = metadata["frame_index"];
+            result.num_vertices = metadata["num_vertices"];
+            result.num_faces = metadata["num_faces"];
+            
+            // Part 1: SMPL-X params (182 float32)
+            const float* params_ptr = static_cast<const float*>(responses[1].data());
+            size_t params_count = responses[1].size() / sizeof(float);
+            
+            // Parse params (offsets based on concatenation order)
+            size_t offset = 0;
+            result.global_orient.assign(params_ptr + offset, params_ptr + offset + 3);
+            offset += 3;
+            
+            result.body_pose.assign(params_ptr + offset, params_ptr + offset + 63);
+            offset += 63;
+            
+            result.left_hand_pose.assign(params_ptr + offset, params_ptr + offset + 45);
+            offset += 45;
+            
+            result.right_hand_pose.assign(params_ptr + offset, params_ptr + offset + 45);
+            offset += 45;
+            
+            result.jaw_pose.assign(params_ptr + offset, params_ptr + offset + 3);
+            offset += 3;
+            
+            result.betas.assign(params_ptr + offset, params_ptr + offset + 10);
+            offset += 10;
+            
+            result.expression.assign(params_ptr + offset, params_ptr + offset + 10);
+            offset += 10;
+            
+            result.transl.assign(params_ptr + offset, params_ptr + offset + 3);
+            
+            // Part 2: Mesh vertices (num_vertices * 3 float32)
+            const float* vertices_ptr = static_cast<const float*>(responses[2].data());
+            size_t vertices_count = responses[2].size() / sizeof(float);
+            result.vertices.assign(vertices_ptr, vertices_ptr + vertices_count);
+            
+            // Part 3: Mesh faces (num_faces * 3 int32)
+            const int32_t* faces_ptr = static_cast<const int32_t*>(responses[3].data());
+            size_t faces_count = responses[3].size() / sizeof(int32_t);
+            result.faces.assign(faces_ptr, faces_ptr + faces_count);
+            
+            // std::cout << "Frame " << result.frame_index << " processed successfully" << std::endl;
+            // std::cout << "Vertices: " << result.num_vertices << ", Faces: " << result.num_faces << std::endl;            
+        }
+        else {
+            std::cerr << "Unexpected response format: " << responses.size() << " parts" << std::endl;
+            result.frame_index = -1;
+            result.num_vertices = 0;
+            result.num_faces = 0;
+        }
+    }
+
+    void reset() 
+    {
+        json metadata = {{"command", "reset"}};
+        std::string metadata_str = metadata.dump();
+        socket.send(zmq::buffer(metadata_str), zmq::send_flags::none);
+        
+        zmq::message_t reply;
+        socket.recv(reply, zmq::recv_flags::none);
+        auto response = json::parse(std::string(static_cast<char*>(reply.data()), reply.size()));
+        std::cout << "Reset: " << response["message"] << std::endl;
+    }
+
+private:
+    zmq::context_t context;
+    zmq::socket_t socket;
+};
+
 struct ClientState
 {
     ClientState() = default;
@@ -429,7 +646,6 @@ public:
                 current_frame     = dataloader->getLastAvailableFrame();
             }
 
-
             reconstruction_logger.logSample(timer.elapsedMillis());
             delta_time = timer.elapsedSeconds();
 
@@ -507,6 +723,64 @@ public:
             }
 
             render_module->updateState(reconstruction, camera, width, height);
+
+            // SMPL-X reconstruction
+            {
+                // Build list of selected camera IDs in order
+                torch::Tensor cam_valid = render_module->getChosenCameraIndices();
+                auto cam_valid_cpu = cam_valid.to(torch::kCPU);
+                auto cam_valid_accessor = cam_valid_cpu.accessor<int,1>();
+
+                std::vector<int> selected_cam_indices;
+                for (int i = 0; i < cam_valid_cpu.size(0); ++i)
+                {
+                    if (cam_valid_accessor[i] == 1) 
+                    {
+                        selected_cam_indices.push_back(i);
+                    }
+                }
+
+                // Get images (this returns them in the order they were selected)
+                torch::Tensor selected_images = render_module->getSelectedCamerasImages();
+                
+                // Get actual camera IDs from dataloader
+                const auto& cameras = dataloader->getCameras();
+                
+                // Build image tensors map (cam_id -> tensor)
+                std::map<std::string, torch::Tensor> image_tensors;
+                std::vector<std::string> selected_cam_ids_str;
+                
+                for (int idx = 0; idx < selected_cam_indices.size(); ++idx)
+                {
+                    int cam_index = selected_cam_indices[idx];
+                    std::string cam_id = std::to_string(cameras[cam_index].id);  // Get actual camera ID/name
+                    torch::Tensor img_tensor = selected_images[idx];
+                    
+                    image_tensors[cam_id] = img_tensor;
+                    selected_cam_ids_str.push_back(cam_id);
+                }
+
+                // Call SMPL-X reconstruction via ZMQ
+                try
+                {
+                    atcg::Timer smplx_timer;
+                    smplx_client.process_frame(image_tensors, selected_cam_ids_str, smplx_result);
+                    float smplx_time = smplx_timer.elapsedMillis();
+                    // std::cout << "SMPL-X processing time: " << smplx_time << " ms" << std::endl;
+
+                    if (smplx_result.frame_index == -1)
+                    {
+                        std::cout << "SMPL-X reconstruction failed." << std::endl;
+                    }
+                    else
+                    {
+                    }
+                }
+                catch (const std::exception& e)
+                {
+                    std::cerr << "SMPL-X reconstruction exception: " << e.what() << std::endl;
+                }
+            }
 
             auto framebuffer = render_module->renderFrame(camera);
 
@@ -635,12 +909,45 @@ public:
 
             {
                 std::lock_guard guard(state->inpaint_mutex);
+                static std::array<float, 178> smplx_params{};
+
+                {
+                    size_t offset = 0;
+
+                    // Global orient (3 floats)
+                    std::copy(smplx_result.global_orient.begin(), smplx_result.global_orient.end(), smplx_params.begin() + offset);
+                    offset += 3;
+
+                    // Body pose (63 floats)
+                    std::copy(smplx_result.body_pose.begin(), smplx_result.body_pose.end(), smplx_params.begin() + offset);
+                    offset += 63;
+
+                    // Left hand pose (45 floats)
+                    std::copy(smplx_result.left_hand_pose.begin(), smplx_result.left_hand_pose.end(), smplx_params.begin() + offset);
+                    offset += 45;
+
+                    // Right hand pose (45 floats)
+                    std::copy(smplx_result.right_hand_pose.begin(), smplx_result.right_hand_pose.end(), smplx_params.begin() + offset);
+                    offset += 45;
+
+                    // Jaw pose (3 floats)
+                    std::copy(smplx_result.jaw_pose.begin(), smplx_result.jaw_pose.end(), smplx_params.begin() + offset);
+                    offset += 3;
+
+                    offset = 165;
+                    std::copy(smplx_result.betas.begin(), smplx_result.betas.end(), smplx_params.begin() + offset);
+                    offset += 10;
+
+                    std::copy(smplx_result.transl.begin(), smplx_result.transl.end(), smplx_params.begin() + offset);
+                }
+
                 state->current_response =
                     std::move(rift::protocol::createUpdateMessage(
                         inv_view_projection, 
                         encoded, 
                         compressedData,
-                        local_frame_idx));
+                        local_frame_idx,
+                        smplx_params));
                 state->inpaint_done = true;
             }
 
@@ -691,6 +998,15 @@ public:
 
         std::thread cli_thread(&RIFTCastServer::cli, this);
         std::thread visual_hull_thread(&RIFTCastServer::visual_hull, this);
+
+        // Init SMPL-X reconstruction
+        {
+            // const std::string default_vci_dir =
+            //     "/data/spindler/Code/VisualComputingGroup/RIFTCast/res/bonn_tele_bench_001";
+            const std::string default_vci_dir =
+                "/data/spindler/Code/VisualComputingGroup/RIFTCast/res/bonn_tele_bench_001";
+            smplx_client.initialize(default_vci_dir);
+        }
 
         // Check for data to send
         while(running)
@@ -747,6 +1063,10 @@ private:
     atcg::Statistic<float> visual_hull_statistic;
     atcg::Statistic<float> inpaint_statistic;
     std::mutex statistic_mutex;
+
+    // SMPL-X reconstruction
+    SMPLXClient smplx_client = SMPLXClient("tcp://localhost:5555");
+    SMPLXResult smplx_result;
 };
 
 atcg::Application* atcg::createApplication()
