@@ -34,6 +34,35 @@
 
 using json = nlohmann::json;
 
+struct SMPLXMeshData
+{
+    std::vector<atcg::Vertex> vertices;
+    std::vector<glm::u32vec3> faces;
+    bool ready = false;
+};
+
+struct SMPLXResult
+{
+    // Metadata
+    int frame_index;
+    int num_vertices;
+    int num_faces;
+    
+    // SMPL-X parameters (182 floats total)
+    std::vector<float> global_orient;      // 3 floats
+    std::vector<float> body_pose;          // 63 floats
+    std::vector<float> left_hand_pose;     // 45 floats
+    std::vector<float> right_hand_pose;    // 45 floats
+    std::vector<float> jaw_pose;           // 3 floats
+    std::vector<float> betas;              // 10 floats
+    std::vector<float> expression;         // 10 floats
+    std::vector<float> transl;             // 3 floats
+    
+    // Mesh data
+    std::vector<float> vertices;           // num_vertices * 3
+    std::vector<int32_t> faces;            // num_faces * 3
+};
+
 class SMPLXClient
 {
 public:
@@ -75,9 +104,10 @@ public:
         }
     }
 
-    json process_frame(
+    void process_frame(
         const std::map<std::string, torch::Tensor>& image_tensors,
-        const std::vector<std::string>& selected_cam_ids)
+        const std::vector<std::string>& selected_cam_ids,
+        SMPLXResult& result)
     {
         // Build metadata
         std::vector<std::string> cam_ids;
@@ -123,12 +153,87 @@ public:
             ++idx;
         }
         
-        // Receive response
-        zmq::message_t reply;
-        socket.recv(reply, zmq::recv_flags::none);
+        // Receive multipart response
+        std::vector<zmq::message_t> responses;
+        int more;
+        size_t more_size = sizeof(more);
         
-        std::string reply_str(static_cast<char*>(reply.data()), reply.size());
-        return json::parse(reply_str);
+        do {
+            zmq::message_t msg;
+            socket.recv(msg, zmq::recv_flags::none);
+            socket.getsockopt(ZMQ_RCVMORE, &more, &more_size);
+            responses.push_back(std::move(msg));
+        } while (more);
+        
+        if (responses.size() == 1) {
+            // Error response (JSON)
+            std::string error_str(static_cast<char*>(responses[0].data()), responses[0].size());
+            auto error_json = json::parse(error_str);
+            
+            // Return empty result on error (or could throw)
+            std::cerr << "Server error: " << error_json["message"].get<std::string>() << std::endl;
+            result.frame_index = -1;
+            result.num_vertices = 0;
+            result.num_faces = 0;
+        }
+        else if (responses.size() == 4) {
+            // Binary response
+            // Part 0: Metadata (JSON)
+            std::string metadata_str(static_cast<char*>(responses[0].data()), responses[0].size());
+            auto metadata = json::parse(metadata_str);
+            
+            result.frame_index = metadata["frame_index"];
+            result.num_vertices = metadata["num_vertices"];
+            result.num_faces = metadata["num_faces"];
+            
+            // Part 1: SMPL-X params (182 float32)
+            const float* params_ptr = static_cast<const float*>(responses[1].data());
+            size_t params_count = responses[1].size() / sizeof(float);
+            
+            // Parse params (offsets based on concatenation order)
+            size_t offset = 0;
+            result.global_orient.assign(params_ptr + offset, params_ptr + offset + 3);
+            offset += 3;
+            
+            result.body_pose.assign(params_ptr + offset, params_ptr + offset + 63);
+            offset += 63;
+            
+            result.left_hand_pose.assign(params_ptr + offset, params_ptr + offset + 45);
+            offset += 45;
+            
+            result.right_hand_pose.assign(params_ptr + offset, params_ptr + offset + 45);
+            offset += 45;
+            
+            result.jaw_pose.assign(params_ptr + offset, params_ptr + offset + 3);
+            offset += 3;
+            
+            result.betas.assign(params_ptr + offset, params_ptr + offset + 10);
+            offset += 10;
+            
+            result.expression.assign(params_ptr + offset, params_ptr + offset + 10);
+            offset += 10;
+            
+            result.transl.assign(params_ptr + offset, params_ptr + offset + 3);
+            
+            // Part 2: Mesh vertices (num_vertices * 3 float32)
+            const float* vertices_ptr = static_cast<const float*>(responses[2].data());
+            size_t vertices_count = responses[2].size() / sizeof(float);
+            result.vertices.assign(vertices_ptr, vertices_ptr + vertices_count);
+            
+            // Part 3: Mesh faces (num_faces * 3 int32)
+            const int32_t* faces_ptr = static_cast<const int32_t*>(responses[3].data());
+            size_t faces_count = responses[3].size() / sizeof(int32_t);
+            result.faces.assign(faces_ptr, faces_ptr + faces_count);
+            
+            // std::cout << "Frame " << result.frame_index << " processed successfully" << std::endl;
+            // std::cout << "Vertices: " << result.num_vertices << ", Faces: " << result.num_faces << std::endl;            
+        }
+        else {
+            std::cerr << "Unexpected response format: " << responses.size() << " parts" << std::endl;
+            result.frame_index = -1;
+            result.num_vertices = 0;
+            result.num_faces = 0;
+        }
     }
 
     void reset() 
@@ -290,27 +395,68 @@ public:
                 }
 
                 // Call SMPL-X reconstruction via ZMQ
-                try 
+                try
                 {
-                    json result = smplx_client.process_frame(image_tensors, selected_cam_ids_str);
-                    
-                    if (result.contains("status"))
+                    atcg::Timer smplx_timer;
+                    smplx_client.process_frame(image_tensors, selected_cam_ids_str, smplx_result);
+                    float smplx_time = smplx_timer.elapsedMillis();
+                    std::cout << "SMPL-X processing time: " << smplx_time << " ms" << std::endl;
+
+                    if (smplx_result.frame_index == -1)
                     {
-                        if (result["status"] == "success")
+                        std::cout << "SMPL-X reconstruction failed." << std::endl;
+                    }
+                    else
+                    {
+                        const glm::vec3 total_pos = { 
+                            smplx_result.transl[0], 
+                            smplx_result.transl[1], 
+                            smplx_result.transl[2] 
+                        };
+
+                        static std::vector<atcg::Vertex> vertices;
+                        vertices.resize(smplx_result.num_vertices);
+
+                        for (int i = 0; i < smplx_result.num_vertices; ++i)
                         {
-                            std::cout << "SMPL-X reconstruction successful" << std::endl;
+                            glm::vec3 pos(
+                                smplx_result.vertices[i * 3 + 0],
+                                smplx_result.vertices[i * 3 + 1],
+                                smplx_result.vertices[i * 3 + 2]
+                            );
+                            vertices[i] = pos + total_pos;
+                        }
+
+                        static std::vector<glm::u32vec3> faces;
+                        faces.resize(smplx_result.num_faces);
+
+                        for (int i = 0; i < smplx_result.num_faces; ++i)
+                        {
+                            uint32_t i0 = static_cast<uint32_t>(smplx_result.faces[i * 3 + 0]);
+                            uint32_t i1 = static_cast<uint32_t>(smplx_result.faces[i * 3 + 1]);
+                            uint32_t i2 = static_cast<uint32_t>(smplx_result.faces[i * 3 + 2]);
+                            faces[i] = glm::u32vec3(i0, i1, i2);
+                        }
+
+                        if (vertices.size() > 0 && faces.size() > 0)
+                        {
+                            // Create a simple test triangle instead of using SMPL-X data
+                            // std::vector<atcg::Vertex> vertices;
+                            // vertices.push_back(atcg::Vertex(glm::vec3(0.0f, 0.0f, 0.0f)));
+                            // vertices.push_back(atcg::Vertex(glm::vec3(1.0f, 0.0f, 0.0f)));
+                            // vertices.push_back(atcg::Vertex(glm::vec3(0.5f, 1.0f, 0.0f)));
+
+                            // std::vector<glm::u32vec3> faces;
+                            // faces.push_back(glm::u32vec3(0, 1, 2));
                             
-                            // Extract SMPL-X parameters if needed
-                            // auto data = result["data"];
-                            // auto global_orient = data["global_orient"]; // etc.
+                            std::lock_guard guard(smplx_mutex);
+                            smplx_mesh_data.vertices = std::move(vertices);
+                            smplx_mesh_data.faces = std::move(faces);
+                            smplx_mesh_data.ready = true;
                         }
-                        else if (result["status"] == "no_detection")
+                        else
                         {
-                            std::cout << "No person detected in frame" << std::endl;
-                        }
-                        else if (result["status"] == "error")
-                        {
-                            std::cerr << "SMPL-X error: " << result["error"] << std::endl;
+                            std::cerr << "Invalid mesh data, skipping" << std::endl;
                         }
                     }
                 }
@@ -318,40 +464,6 @@ public:
                 {
                     std::cerr << "SMPL-X reconstruction exception: " << e.what() << std::endl;
                 }
-                
-                // Build images dict
-                // py::dict images_dict;
-                // for (int idx = 0; idx < selected_cam_id_list.size(); ++idx)
-                // {
-                //     int cam_id = selected_cam_id_list[idx];
-                //     torch::Tensor img_tensor = selected_images[idx];  // ✓ This is correct
-                //     images_dict[py::str(std::to_string(cam_id))] = tensor_to_numpy(img_tensor);
-                // }
-
-                // Build Python list for selected_cam_ids
-                // py::list selected_cam_ids;
-                // for (int cam_id : selected_cam_id_list)
-                // {
-                //     selected_cam_ids.append(cam_id);
-                // }
-
-                // py::object result_obj = smplx_reconstructor.attr("process_frame")(images_dict, selected_cam_ids);
-                
-                // if (!result_obj.is_none())
-                // {
-                //     py::dict result = result_obj.cast<py::dict>();
-                    
-                //     auto global_orient_np = result["global_orient"].cast<py::array_t<float>>();
-                //     auto body_pose_np = result["body_pose"].cast<py::array_t<float>>();
-                //     auto betas_np = result["betas"].cast<py::array_t<float>>();
-                //     auto transl_np = result["transl"].cast<py::array_t<float>>();
-                //     auto left_hand_pose_np = result["left_hand_pose"].cast<py::array_t<float>>();
-                //     auto right_hand_pose_np = result["right_hand_pose"].cast<py::array_t<float>>();
-                //     auto jaw_pose_np = result["jaw_pose"].cast<py::array_t<float>>();
-                //     auto expression_np = result["expression"].cast<py::array_t<float>>();
-                    
-                //     // Use the SMPL-X parameters...
-                // }
             }
 
             auto framebuffer = render_module->renderFrame(camera);
@@ -424,7 +536,6 @@ public:
                 torch::cuda::synchronize();
             }
 
-
             // 3. Start rendering thread again
             start_rendering = true;
         }
@@ -436,31 +547,22 @@ public:
             rift::unprojectVertices(output_img, inv_view_projection, output_depth, output_normals);
         if(vertices.numel() > 0)
         {
-            // Load SMPL-X mesh and set current frame
-            // if (smplx_graphs.size() <= mesh_frame_idx_local) 
-            // {
-            //     smplx_graphs.resize(mesh_frame_idx_local + 1); 
-            //     smplx_graphs[mesh_frame_idx_local] = nullptr;
-            // }
-            // if (smplx_graphs[mesh_frame_idx_local] == nullptr)
-            // {
-            //     for (size_t frame_idx = 0; frame_idx < smplx_graphs.size(); ++frame_idx) 
-            //     {
-            //         if (smplx_graphs[frame_idx] == nullptr) 
-            //         {
-            //             const std::string mesh_path = "./res/meshes/smplest_x_mesh_" + std::to_string(frame_idx) + ".obj";
-            //             std::cout << "Loading mesh: " << mesh_path << std::endl;
-            //             smplx_graphs[frame_idx] = atcg::IO::read_mesh(mesh_path);
-            //         }
-            //     }
-            // }
-            // auto& geometry = mesh_entity.getComponent<atcg::GeometryComponent>();
-            // geometry.graph = smplx_graphs[mesh_frame_idx_local];
+            // Update SMPL-X mesh on MAIN thread (safe ECS access)
+            {
+                std::lock_guard guard(smplx_mutex);
+                if (smplx_mesh_data.ready)
+                {
+                    smplx_graph = atcg::Graph::createTriangleMesh(smplx_mesh_data.vertices, smplx_mesh_data.faces);
+                    mesh_entity.getComponent<atcg::GeometryComponent>().graph = smplx_graph;
 
-            // Update SMPL-X translation for moving out of origin
-            auto& transform = mesh_entity.getComponent<atcg::TransformComponent>();
-            transform.setPosition(glm::vec3(1.0f, 0.0f, 1.0f) * static_cast<float>(mesh_frame_idx_local) * 0.005f + glm::vec3(-0.35f, 0.0f, -0.25f));
+                    auto& transform = mesh_entity.getComponent<atcg::TransformComponent>();
+                    transform.setPosition(glm::vec3(0.0f, 0.0f, 0.0f));
+                    // transform.setRotation(glm::vec3(0.0f, 0.0f, glm::pi<float>()));
 
+                    smplx_mesh_data.ready = false;
+                }
+            }
+            
             // Point cloud
             pointcloud->resizeVertices(vertices.size(0));
             pointcloud->getDevicePositions().index_put_({torch::indexing::Slice(), torch::indexing::Slice()}, vertices);
@@ -478,23 +580,6 @@ public:
         // Init smplx client
         {
             smplx_client.initialize("/data/jspindle/vci_data");
-
-            // // Aquire GIL
-            // py::gil_scoped_acquire acquire;
-
-            // // Add scrypts folder to python
-            // py::module_ sys = py::module_::import("sys");
-            // sys.attr("path").attr("append")("SMPLest-X");
-
-            // // Import script
-            // py::module_ script = py::module_::import("main.vci_server");
-
-            // // Create reconstructor
-            // smplx_reconstructor = script.attr("create_reconstructor")();
-
-            // // Init session
-            // std::string vci_dir = "/data/jspindle/vci_data";
-            // smplx_reconstructor.attr("initialize_session")(vci_dir);
         }        
 
         atcg::Application::get()->enableDockSpace(true);
@@ -558,7 +643,7 @@ public:
             mesh_entity     = scene->createEntity("SMPL-X Mesh");
             auto& transform = mesh_entity.addComponent<atcg::TransformComponent>();
             mesh_entity.addComponent<atcg::GeometryComponent>(nullptr);
-            // auto& renderer = mesh_entity.addComponent<atcg::MeshRenderComponent>();
+            auto& renderer = mesh_entity.addComponent<atcg::MeshRenderComponent>();
         }
 
         auto f = pfd::open_file("Choose scene meta file", pfd::path::home(), {"Json", "*.json"}, pfd::opt::none);
@@ -961,9 +1046,12 @@ private:
     atcg::Entity hovered_entity;
 
     atcg::Entity mesh_entity;
-    std::vector<atcg::ref_ptr<atcg::Graph>> smplx_graphs;
+    atcg::ref_ptr<atcg::Graph> smplx_graph;
+    std::mutex smplx_mutex;
     uint32_t mesh_frame_idx = 0;
     SMPLXClient smplx_client = SMPLXClient("tcp://localhost:5555");
+    SMPLXResult smplx_result;
+    SMPLXMeshData smplx_mesh_data;
 
     atcg::ref_ptr<rift::DatasetImporter> dataloader;
     // atcg::ref_ptr<rift::GeometryModule> geometry_module;
