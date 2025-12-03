@@ -252,18 +252,24 @@ struct ClientState
 
     ClientState(std::function<void(ClientState*)> render_function,
                 std::function<void(ClientState*)> inpaint_function,
+                std::function<void(ClientState*)> smplx_function,
                 const atcg::ref_ptr<rift::DatasetImporter>& dataloader)
     {
         running        = true;
         render_thread  = std::thread(render_function, this);
         inpaint_thread = std::thread(inpaint_function, this);
+
+        smplx_running = true;
+        smplx_thread  = std::thread(smplx_function, this);
     }
 
     void stop()
     {
         running = false;
+        smplx_running = false;
         if(render_thread.joinable()) render_thread.join();
         if(inpaint_thread.joinable()) inpaint_thread.join();
+        if (smplx_thread.joinable()) smplx_thread.join();
     }
 
     ~ClientState() { /*render_module.reset();*/ }
@@ -303,6 +309,18 @@ struct ClientState
     std::thread inpaint_thread;
     std::mutex inpaint_mutex;
     std::atomic_bool start_inpaint = false;
+
+    // SMPL-X
+    std::thread smplx_thread;
+    std::mutex smplx_mutex;
+    std::atomic_bool smplx_running = false;
+    std::atomic_bool smplx_has_work = false;
+
+    std::map<std::string, torch::Tensor> smplx_input_images;
+    std::vector<std::string> smplx_input_cam_ids;
+
+    SMPLXResult smplx_output_result;
+    std::atomic_bool smplx_output_ready = false;
 };
 
 class RIFTCastServer : public atcg::Application
@@ -322,12 +340,53 @@ public:
         uint64_t client_id;
     };
 
+    void process_smplx(ClientState* state)
+    {
+        while(state->smplx_running)
+        {
+            if(!state->smplx_has_work)
+            {
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                continue;
+            }
+            
+            state->smplx_has_work = false;
+            
+            std::map<std::string, torch::Tensor> image_tensors;
+            std::vector<std::string> selected_cam_ids;
+            
+            {
+                std::lock_guard guard(state->smplx_mutex);
+                image_tensors = state->smplx_input_images;
+                selected_cam_ids = state->smplx_input_cam_ids;
+            }
+            
+            SMPLXResult result;
+            try
+            {
+                smplx_client.process_frame(image_tensors, selected_cam_ids, result);
+            }
+            catch (const std::exception& e)
+            {
+                std::cerr << "SMPL-X reconstruction exception: " << e.what() << std::endl;
+                result.frame_index = -1;
+            }
+            
+            {
+                std::lock_guard guard(state->smplx_mutex);
+                state->smplx_output_result = result;
+                state->smplx_output_ready = true;
+            }
+        }
+    }
+
     void process_connect(const uint64_t client_id)
     {
         client_states.insert(
             std::make_pair(client_id,
                            atcg::make_ref<ClientState>([this](ClientState* state) { this->render(state); },
                                                        [this](ClientState* state) { this->inpaint(state); },
+                                                       [this](ClientState* state) { this->process_smplx(state); },
                                                        dataloader)));
     }
 
@@ -724,7 +783,7 @@ public:
 
             render_module->updateState(reconstruction, camera, width, height);
 
-            // SMPL-X reconstruction
+            // SMPL-X reconstruction (async)
             {
                 // Build list of selected camera IDs in order
                 torch::Tensor cam_valid = render_module->getChosenCameraIndices();
@@ -740,45 +799,40 @@ public:
                     }
                 }
 
-                // Get images (this returns them in the order they were selected)
+                // Get images
                 torch::Tensor selected_images = render_module->getSelectedCamerasImages();
                 
                 // Get actual camera IDs from dataloader
                 const auto& cameras = dataloader->getCameras();
                 
-                // Build image tensors map (cam_id -> tensor)
+                // Build image tensors map
                 std::map<std::string, torch::Tensor> image_tensors;
                 std::vector<std::string> selected_cam_ids_str;
                 
                 for (int idx = 0; idx < selected_cam_indices.size(); ++idx)
                 {
                     int cam_index = selected_cam_indices[idx];
-                    std::string cam_id = std::to_string(cameras[cam_index].id);  // Get actual camera ID/name
-                    torch::Tensor img_tensor = selected_images[idx];
+                    std::string cam_id = std::to_string(cameras[cam_index].id);
+                    torch::Tensor img_tensor = selected_images[idx].clone(); // Clone to avoid race conditions
                     
                     image_tensors[cam_id] = img_tensor;
                     selected_cam_ids_str.push_back(cam_id);
                 }
 
-                // Call SMPL-X reconstruction via ZMQ
-                try
+                // Submit work to SMPL-X thread (non-blocking)
                 {
-                    atcg::Timer smplx_timer;
-                    smplx_client.process_frame(image_tensors, selected_cam_ids_str, smplx_result);
-                    float smplx_time = smplx_timer.elapsedMillis();
-                    // std::cout << "SMPL-X processing time: " << smplx_time << " ms" << std::endl;
-
-                    if (smplx_result.frame_index == -1)
-                    {
-                        std::cout << "SMPL-X reconstruction failed." << std::endl;
-                    }
-                    else
-                    {
-                    }
+                    std::lock_guard guard(state->smplx_mutex);
+                    state->smplx_input_images = std::move(image_tensors);
+                    state->smplx_input_cam_ids = std::move(selected_cam_ids_str);
+                    state->smplx_has_work = true;
                 }
-                catch (const std::exception& e)
+                
+                // Check if previous SMPL-X result is ready
+                if(state->smplx_output_ready)
                 {
-                    std::cerr << "SMPL-X reconstruction exception: " << e.what() << std::endl;
+                    std::lock_guard guard(state->smplx_mutex);
+                    smplx_result = state->smplx_output_result;
+                    state->smplx_output_ready = false;
                 }
             }
 
