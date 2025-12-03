@@ -21,6 +21,56 @@
 #include <riftcast/protocol/riftcastprotocol.h>
 #include <riftcast/BenchmarkLogger.h>
 
+#include <smplx.hpp>
+#include <torch/torch.h>
+#include <tuple>
+
+struct SmplOutput
+{
+    torch::Tensor global_orient;
+    torch::Tensor body_pose;
+    torch::Tensor betas;
+    torch::Tensor transl;
+};
+
+SmplOutput convert_smplx_params_to_smpl(
+    const torch::Tensor& fullpose_smplx, // Shape: (B, 165)
+    const torch::Tensor& betas_smplx,    // Shape: (B, 300)
+    const torch::Tensor& transl_smplx)    // Shape: (B, 3) 
+{
+    namespace F = torch::indexing;
+    
+    // Reshape fullpose to (Batch, 55 joints, 3 rot params) to make slicing easier
+    // 55 joints = 1 global + 21 body + 2 hands + others (face/feet/etc)
+    auto fullpose_reshaped = fullpose_smplx.reshape({-1, 55, 3});
+
+
+    auto global_orient_smpl = fullpose_reshaped.index({F::Slice(), 0}); // Shape (B, 3)
+    auto body_pose_x = fullpose_reshaped.index({F::Slice(), F::Slice(1, 22)}); 
+    auto left_wrist = fullpose_reshaped.index({F::Slice(), F::Slice(25, 26)});
+    auto right_wrist = fullpose_reshaped.index({F::Slice(), F::Slice(40, 41)});
+    auto body_pose_smpl_composed = torch::cat({body_pose_x, left_wrist, right_wrist}, 1);
+    auto body_pose_smpl_flat = body_pose_smpl_composed.reshape({body_pose_smpl_composed.size(0), -1});
+
+
+    // Python: betas_smpl = betas_smplx[:, :300]
+    auto betas_smpl = betas_smplx.index({F::Slice(), F::Slice(0, 300)}).clone();
+
+    // Update Beta 0 and 1
+    auto b0_input = betas_smpl.index({F::Slice(), 0});
+    auto b1_input = betas_smpl.index({F::Slice(), 1});
+    betas_smpl.index_put_({F::Slice(), 0}, (0.6826095)*b0_input - (0.1245366)*b1_input - (0.0792477));
+    betas_smpl.index_put_({F::Slice(), 1}, (0.0182429)*b0_input + (0.3093621)*b1_input + (0.0447035));
+
+    // Handle Translation
+    auto transl_smpl = transl_smplx.clone();
+    auto beta0_original = betas_smplx.index({F::Slice(), 0});
+    auto y_offset = (0.00888539)*beta0_original + (1.15908373);
+    transl_smpl.index_put_({F::Slice(), 1}, transl_smpl.index({F::Slice(), 1}) + y_offset);
+
+    return {global_orient_smpl, body_pose_smpl_flat, betas_smpl, transl_smpl};
+}
+
 class RIFTCastClientLayer : public atcg::Layer
 {
 public:
@@ -34,9 +84,162 @@ public:
         client.disconnect();
     }
 
-    std::pair<torch::Tensor, uint32_t>
+    // Helper function to compute SMPL mesh for the current frame (Hydran00/torchure_smplx API)
+    atcg::ref_ptr<atcg::Graph> computeSMPLXMesh()
+    {
+        torch::NoGradGuard no_grad;
+        auto opts_f32_gpu = torch::TensorOptions().dtype(torch::kFloat32).device(atcg::GPU);
+        
+        // Extract fullpose (indices 0-164)
+        torch::Tensor fullpose = torch::from_blob(
+            smplx_params_buffer.data(),
+            {1, 165},
+            torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU)
+        ).clone().to(atcg::GPU);
+        
+        // Extract betas (indices 165-174, total 10 values)
+        // Pad with zeros to reach 300 as expected by converter
+        torch::Tensor betas_10 = torch::from_blob(
+            smplx_params_buffer.data() + 165,
+            {1, 10},
+            torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU)
+        ).clone().to(atcg::GPU);
+        
+        torch::Tensor betas_smplx = torch::zeros({1, 300}, opts_f32_gpu);
+        betas_smplx.index_put_({torch::indexing::Slice(), torch::indexing::Slice(0, 10)}, betas_10);
+        
+        // Extract translation (indices 175-177)
+        torch::Tensor transl_smplx = torch::from_blob(
+            smplx_params_buffer.data() + 175,
+            {1, 3},
+            torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU)
+        ).clone().to(atcg::GPU);
+
+        // Call the converter function
+        SmplOutput smpl_out = convert_smplx_params_to_smpl(
+            fullpose,
+            betas_smplx,
+            transl_smplx
+        );
+
+        // Forward pass with default parameters (recomputes mesh each frame)
+        auto output = smplx_model->forward(
+            smplx::betas(smpl_out.betas),
+            smplx::body_pose(smpl_out.body_pose),
+            smplx::global_orient(smpl_out.global_orient),
+            smplx::transl(smpl_out.transl),
+            smplx::return_verts(true)
+        );
+
+        if (!output.vertices.has_value())
+        {
+            // Fallback: return the persistent graph (already allocated) even if we didn’t update this frame
+            return smpl_graph_ ? smpl_graph_ : atcg::Graph::createTriangleMesh();
+        }
+
+        // verts: [V, 3] float32 on GPU
+        torch::Tensor verts = output.vertices.value().squeeze(0).to(torch::kFloat32).to(atcg::GPU);
+
+        // Compute vertex normals using precomputed i0/i1/i2 (all on GPU)
+        torch::Tensor v0 = verts.index({smpl_i0_});
+        torch::Tensor v1 = verts.index({smpl_i1_});
+        torch::Tensor v2 = verts.index({smpl_i2_});
+
+        torch::Tensor fn = torch::cross(v1 - v0, v2 - v0, /*dim=*/1); // [F,3]
+        torch::Tensor vn = torch::zeros({smpl_V_, 3}, opts_f32_gpu);
+        vn.index_add_(0, smpl_i0_, fn);
+        vn.index_add_(0, smpl_i1_, fn);
+        vn.index_add_(0, smpl_i2_, fn);
+
+        torch::Tensor vn_unit = vn / torch::clamp(torch::sqrt((vn * vn).sum(1, true)), 1e-9f);
+
+        // Write into the Graph’s GPU buffers directly (no [V,15] pack, no reallocs)
+        // Positions
+        smpl_graph_->getDevicePositions().index_put_({torch::indexing::Slice(), torch::indexing::Slice()}, verts);
+        // Normals
+        smpl_graph_->getDeviceNormals().index_put_({torch::indexing::Slice(), torch::indexing::Slice()}, vn_unit);
+        // Colors/UV/Tangent were set once at init; update if you need dynamic values
+
+        smpl_graph_->unmapDeviceVertexPointer(); // Unmap after writes (mirrors pointcloud usage)
+
+        return smpl_graph_;
+    }
+
+    // Initialize SMPL model with defaults, adapted to Hydran00/torchure_smplx behavior
+    void initializeSMPLX()
+    {
+        // Path to SMPL model file (.npz as used in torchure_smplx)
+        const char* smplx_model_path = "./res/models/smpl/SMPL_NEUTRAL.npz";
+
+        // Create model instance
+        smplx_model = std::make_unique<smplx::SMPL>(
+            smplx_model_path,
+            atcg::GPU,
+            smplx::batch_size(1)
+        );
+
+        // Ensure model parameters are float while index buffers remain integer types, mirroring smplx_test.cpp
+        smplx_model->to(torch::kFloat);
+        for (auto& buffer : smplx_model->named_buffers())
+        {
+            const std::string& name = buffer.key();
+            if (name.find("parents") != std::string::npos ||
+                name.find("faces")   != std::string::npos ||
+                name.find("kintree") != std::string::npos)
+            {
+                buffer.value().set_data(buffer.value().to(torch::kLong));
+            }
+        }
+        smplx_model->to(atcg::GPU);
+
+        {
+            // Faces are constant: keep them on GPU (int32) and contiguous
+            smpl_faces_gpu_ = smplx_model->faces().to(torch::kInt32).to(atcg::GPU).contiguous();
+            smpl_F_ = smpl_faces_gpu_.size(0);
+
+            // Do one cheap forward to find V (number of vertices)
+            torch::NoGradGuard no_grad;
+            auto Zf = torch::zeros({1, 55 * 3}, torch::TensorOptions().dtype(torch::kFloat32).device(atcg::GPU));
+            auto Zb = torch::zeros({1, 300}, torch::TensorOptions().dtype(torch::kFloat32).device(atcg::GPU));
+            auto Zt = torch::zeros({1, 3},   torch::TensorOptions().dtype(torch::kFloat32).device(atcg::GPU));
+
+            auto smpl_in = convert_smplx_params_to_smpl(Zf, Zb, Zt);
+            auto out0 = smplx_model->forward(
+                smplx::betas(smpl_in.betas),
+                smplx::body_pose(smpl_in.body_pose),
+                smplx::global_orient(smpl_in.global_orient),
+                smplx::transl(smpl_in.transl),
+                smplx::return_verts(true)
+            );
+            TORCH_CHECK(out0.vertices.has_value(), "SMPL forward did not return vertices at init");
+            smpl_V_ = out0.vertices.value().squeeze(0).size(0);
+
+            // Create a Graph once, set faces once, and initialize constant attributes
+            auto opts_f32_gpu = torch::TensorOptions().dtype(torch::kFloat32).device(atcg::GPU);
+
+            // Allocate vertex buffer on GPU (we’ll only write positions/normals per frame)
+            torch::Tensor init_vertices = torch::zeros({smpl_V_, 15}, opts_f32_gpu);
+            // Set color to white once
+            init_vertices.index_put_({torch::indexing::Slice(), torch::indexing::Slice(3, 6)}, 1.0f);
+            // Tangent/UV remain zeros
+
+            smpl_graph_ = atcg::Graph::createTriangleMesh(init_vertices, smpl_faces_gpu_);
+            // Optional: unmap after initial fill
+            smpl_graph_->unmapDeviceVertexPointer();
+
+            // Precompute index tensors for normals (int64 for advanced indexing)
+            smpl_i0_ = smpl_faces_gpu_.index({torch::indexing::Slice(), 0}).to(torch::kLong);
+            smpl_i1_ = smpl_faces_gpu_.index({torch::indexing::Slice(), 1}).to(torch::kLong);
+            smpl_i2_ = smpl_faces_gpu_.index({torch::indexing::Slice(), 2}).to(torch::kLong);
+        }
+    }
+
+    std::tuple<torch::Tensor, uint32_t, const std::array<float, 178>&>
     request_vertices(const glm::mat4& view, const glm::mat4& projection, const uint32_t width, const uint32_t height)
     {
+        // TODO: Move
+        static std::array<float, 178> smplx_params_buffer;
+
         atcg::Timer timer;
         // Send camera data
         auto message = rift::protocol::createRenderRequest(width, height, view, projection);
@@ -55,10 +258,10 @@ public:
                        RIFTCAST_PROTOCOL_VERSION_MINOR,
                        header.version.major,
                        header.version.minor);
-            return {};
+            return {{}, -1u, smplx_params_buffer};
         }
 
-        if(header.task == rift::protocol::MessageTask::NO_UPDATE) return {{}, -1u};
+        if(header.task == rift::protocol::MessageTask::NO_UPDATE) return {{}, -1u, smplx_params_buffer};
 
         bandwidth_logger.logSample(received_data.size());
 
@@ -69,6 +272,10 @@ public:
         float* projection_data = (float*)(received_data.data() + offset);
         offset += projection_size;
         glm::mat4 inv_view_projection = glm::make_mat4(projection_data);
+
+        uint32_t smplx_params_size = atcg::NetworkUtils::readInt<uint32_t>(received_data.data(), offset);
+        std::memcpy(smplx_params_buffer.data(), received_data.data() + offset, smplx_params_size);
+        offset += smplx_params_size;
 
         uint32_t image_size = atcg::NetworkUtils::readInt<uint32_t>(received_data.data(), offset);
 
@@ -93,7 +300,7 @@ public:
 
         runtime_logger.logSample(timer.elapsedMillis());
 
-        return {vertices, frame_idx};
+        return {vertices, frame_idx, smplx_params_buffer};
     }
 
     void request_data()
@@ -102,11 +309,16 @@ public:
         {
             if(!done)
             {
-                auto [current_vertices_local, frame_idx] =
+                auto [current_vertices_local, frame_idx, smplx_params] =
                     request_vertices(current_view, current_projection, current_width, current_height);
                 current_vertices = current_vertices_local;
-                if(frame_idx != -1) mesh_frame_idx   = frame_idx;
-                done             = true;
+                if(frame_idx != -1) 
+                {
+                    mesh_frame_idx   = frame_idx;
+                }
+                smplx_params_buffer = smplx_params;
+
+                done = true;
             }
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
@@ -137,13 +349,8 @@ public:
 
             // SMPL-X
             {
-                auto& geometry = mesh_entity.getComponent<atcg::GeometryComponent>();
-                geometry.graph = smplx_graphs[mesh_frame_idx];
-
-                // Update SMPL-X translation for moving out of origin
-                auto& transform = mesh_entity.getComponent<atcg::TransformComponent>();
-                transform.setPosition(glm::vec3(1.0f, 0.0f, 1.0f) * static_cast<float>(mesh_frame_idx) * 0.005f +
-                                      glm::vec3(-0.35f, 0.0f, -0.25f));
+                computeSMPLXMesh();
+                mesh_entity.getComponent<atcg::GeometryComponent>().graph = smpl_graph_;
             }
 
             done = false;
@@ -286,19 +493,17 @@ public:
             scene->setSkybox(skybox);
         }
 
-        smplx_graphs.resize(251);
-        for(size_t frame_idx = 0; frame_idx < 251; ++frame_idx)
+        // Init SMPL-X mesh
         {
-            const std::string mesh_path =
-                "./res/meshes/smplest_x_mesh_" + std::to_string(frame_idx) + ".obj";
-            std::cout << "Loading mesh: " << mesh_path << std::endl;
-            smplx_graphs[frame_idx] = (atcg::IO::read_mesh(mesh_path));
-        }
-        {
+            initializeSMPLX();
+
             mesh_entity = scene->createEntity("SMPL-X Mesh");
             mesh_entity.addComponent<atcg::TransformComponent>();
             mesh_entity.addComponent<atcg::GeometryComponent>();
             mesh_entity.addComponent<atcg::MeshRenderComponent>();
+
+            auto& transform = mesh_entity.getComponent<atcg::TransformComponent>();
+            transform.setPosition(glm::vec3(1.0f, -1.25f, 1.0f));
         }
 
         uint32_t width, height;
@@ -642,8 +847,15 @@ private:
 
     // SMPL-X
     atcg::Entity mesh_entity;
-    std::vector<atcg::ref_ptr<atcg::Graph>> smplx_graphs;
     uint32_t mesh_frame_idx = 0;
+
+    std::unique_ptr<smplx::SMPL> smplx_model;
+    atcg::ref_ptr<atcg::Graph> smpl_graph_;
+    torch::Tensor smpl_faces_gpu_;
+    torch::Tensor smpl_i0_, smpl_i1_, smpl_i2_;
+    int64_t smpl_V_ = 0;
+    int64_t smpl_F_ = 0;
+    std::array<float, 178> smplx_params_buffer;
 };
 
 class RIFTCastClient : public atcg::Application
